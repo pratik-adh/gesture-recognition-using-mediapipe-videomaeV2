@@ -1,0 +1,12 @@
+
+*dataset*/
+*videos*/
+
+*model*
+
+*.jpg
+*.jpeg
+*.png
+*.env
+
+/train-test-val-split
