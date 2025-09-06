@@ -1,1136 +1,1658 @@
-"""
-VideoMAE Training Pipeline for Nepali Sign Language Gesture Recognition
-========================================================================
-This pipeline implements a robust training structure specifically designed
-for VideoMAE with preprocessed 224x224 RGB videos from MediaPipe.
-"""
-
 import os
 import torch
 import torch.nn as nn
-import torch.optim as optim
+import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
-from torch.cuda.amp import autocast, GradScaler
 import numpy as np
-import cv2
 from pathlib import Path
+import random
+from typing import Tuple, List, Dict, Optional
+from transformers import VideoMAEForVideoClassification, VideoMAEConfig, VideoMAEImageProcessor
+from sklearn.model_selection import StratifiedKFold
+from sklearn.metrics import accuracy_score, classification_report, confusion_matrix
 from tqdm import tqdm
 import json
-import random
-from typing import Dict, List, Tuple, Optional
-import matplotlib.pyplot as plt
-import seaborn as sns
-from sklearn.model_selection import StratifiedKFold
-from sklearn.metrics import confusion_matrix, classification_report
-import pandas as pd
-from collections import defaultdict
+import time
+import gc
 import warnings
+import yaml
+import logging
+from dataclasses import dataclass
 warnings.filterwarnings('ignore')
 
-# Import VideoMAE components
-from transformers import (
-    VideoMAEForVideoClassification,
-    VideoMAEImageProcessor,
-    VideoMAEConfig
-)
-from transformers import TrainingArguments, Trainer
-
-# Set style for better plots
-plt.style.use('seaborn-v0_8-darkgrid')
-sns.set_palette("husl")
-
-os.environ.setdefault("PYTORCH_MPS_HIGH_WATERMARK_RATIO", "0.0")
-
-INPUT_ROOT   = Path("preprocessed_videos")          # << change if different
-OUTPUT_ROOT  = Path("videomae_results") 
+# Plotting imports
+import matplotlib
+matplotlib.use('Agg')
+import matplotlib.pyplot as plt
+import seaborn as sns
+from scipy import interpolate
+plt.style.use('default')
+plt.rcParams['figure.dpi'] = 100
+plt.rcParams['savefig.dpi'] = 150
 
 
-class VideoGestureDataset(Dataset):
-    """
-    Custom dataset for loading preprocessed gesture videos.
-    Expects 224x224 RGB videos from MediaPipe preprocessing.
-    """
+# =================== CONFIGURATION MANAGEMENT ===================
+
+@dataclass
+class TrainingConfig:
+    """Configuration class optimized for small datasets with VideoMAE-Small-Kinetics"""
+    # Data settings
+    data_dir: str = "tensor_preprocessed"
+    save_dir: str = "videomae_small_kinetics_output"
+    num_labels: int = 36  # Updated for your dataset
     
-    def __init__(self, 
-                 video_paths: List[Path],
-                 labels: List[int],
-                 num_frames: int = 16,
-                 sampling_strategy: str = 'uniform',
-                 processor=None,
-                 augment: bool = False):
-        """
-        Args:
-            video_paths: List of paths to video files
-            labels: List of corresponding labels
-            num_frames: Number of frames to sample (VideoMAE expects 16)
-            sampling_strategy: 'uniform', 'random', or 'center'
-            processor: VideoMAE processor for normalization
-            augment: Whether to apply augmentations
-        """
-        self.video_paths = video_paths
-        self.labels = labels
-        self.num_frames = num_frames
-        self.sampling_strategy = sampling_strategy
-        self.processor = processor
-        self.augment = augment
-        
-        # VideoMAE normalization values (ImageNet)
-        self.mean = np.array([0.485, 0.456, 0.406])
-        self.std = np.array([0.229, 0.224, 0.225])
+    # Model settings - Optimized for small kinetics model and small dataset
+    model_name: str = "MCG-NJU/videomae-small-finetuned-kinetics"
+    freeze_backbone: bool = True  # Critical for small datasets
+    freeze_layers_from: int = -1  # Only unfreeze last layer if not fully frozen
+    dropout_rate: float = 0.5  # High dropout for regularization
+    use_feature_extractor_mode: bool = True  # Additional conservative option
     
-    def load_video(self, path: Path) -> np.ndarray:
-        """Load video and return frames matching MediaPipe output specs"""
-        cap = cv2.VideoCapture(str(path))
-        if not cap.isOpened():
-            raise ValueError(f"Cannot open video file: {path}")
-        
-        frames = []
-        
-        while True:
-            ret, frame = cap.read()
-            if not ret:
-                break
-            
-            # Verify frame shape
-            if frame.shape != (224, 224, 3):
-                if len(frame.shape) == 2:  # Grayscale
-                    frame = cv2.cvtColor(frame, cv2.COLOR_GRAY2RGB)
-                if frame.shape[:2] != (224, 224):  # Wrong size
-                    frame = cv2.resize(frame, (224, 224))
-            
-            # Convert BGR to RGB (MediaPipe outputs BGR, VideoMAE expects RGB)
-            frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-            
-            # Ensure uint8 dtype
-            if frame.dtype != np.uint8:
-                frame = np.clip(frame, 0, 255).astype(np.uint8)
-            
-            frames.append(frame)
-        
-        cap.release()
-        
-        if len(frames) == 0:
-            raise ValueError(f"No frames loaded from video: {path}")
-        
-        frames_array = np.array(frames, dtype=np.uint8)
-        
-        # Verify shape
-        if len(frames_array.shape) != 4 or frames_array.shape[1:] != (224, 224, 3):
-            raise ValueError(f"Unexpected frames shape: {frames_array.shape}, expected (N, 224, 224, 3)")
-        
-        return frames_array
+    # Training settings - Conservative for small dataset (~145 samples/class)
+    batch_size: int = 8  # Increased slightly due to smaller model
+    epochs: int = 30  # More epochs due to conservative learning
+    learning_rate: float = 1e-4  # Higher LR possible due to kinetics fine-tuning
+    weight_decay: float = 0.01  # Moderate weight decay
+    warmup_steps: int = 100
     
-    def sample_frames(self, frames: np.ndarray) -> np.ndarray:
-        """Sample frames according to strategy"""
-        total_frames = len(frames)
+    # Regularization settings - Enhanced for overfitting prevention
+    label_smoothing: float = 0.1  # Add label smoothing
+    mixup_alpha: float = 0.2  # Add mixup augmentation
+    cutmix_alpha: float = 1.0  # Add cutmix augmentation
+    augmentation_prob: float = 0.8  # Probability of applying augmentations
+    
+    # Validation settings
+    n_folds: int = 5
+    val_frequency: int = 1
+    early_stopping_patience: int = 10  # Increased patience for small dataset
+    min_delta: float = 0.001  # Minimum improvement threshold
+    
+    # Optimization settings
+    mixed_precision: bool = True
+    gradient_accumulation_steps: int = 2
+    max_grad_norm: float = 1.0
+    
+    # Hardware settings
+    num_workers: int = 2
+    pin_memory: bool = True
+    
+    # Advanced training strategies
+    progressive_unfreezing: bool = False  # Option for staged unfreezing
+    use_cosine_annealing: bool = True
+    use_warmup: bool = True
+    save_best_model_only: bool = True
+    
+    # Misc
+    seed: int = 42
+    save_plots_every_fold: bool = True
+    log_level: str = "INFO"
+    
+    def validate_config(self):
+        """Validate configuration for small dataset"""
+        warnings = []
         
-        if total_frames == 0:
-            raise ValueError("Video has no frames")
+        if not self.freeze_backbone and self.num_labels * 145 < 10000:  # Assuming ~145 samples/class
+            warnings.append("WARNING: Unfrozen backbone with small dataset may cause overfitting")
         
-        if total_frames < self.num_frames:
-            # Repeat frames if video is too short
-            indices = list(range(total_frames))
-            while len(indices) < self.num_frames:
-                indices.extend(list(range(total_frames)))
-            indices = sorted(indices[:self.num_frames])
+        if self.batch_size > 16:
+            warnings.append("WARNING: Large batch size may reduce regularization effect")
+        
+        if self.learning_rate > 5e-4 and not self.freeze_backbone:
+            warnings.append("WARNING: High learning rate with unfrozen backbone may cause instability")
+            
+        return warnings
+
+
+def setup_logging(log_level: str = "INFO", save_dir: str = "output"):
+    """Setup logging configuration"""
+    os.makedirs(save_dir, exist_ok=True)
+    
+    logging.basicConfig(
+        level=getattr(logging, log_level),
+        format='%(asctime)s - %(levelname)s - %(message)s',
+        handlers=[
+            logging.FileHandler(f'{save_dir}/training.log'),
+            logging.StreamHandler()
+        ]
+    )
+    return logging.getLogger(__name__)
+
+
+def save_config(config: TrainingConfig, filepath: str):
+    """Save configuration to YAML file"""
+    with open(filepath, 'w') as f:
+        yaml.dump(config.__dict__, f, default_flow_style=False)
+
+
+def load_config(filepath: str) -> TrainingConfig:
+    """Load configuration from YAML file"""
+    with open(filepath, 'r') as f:
+        config_dict = yaml.safe_load(f)
+    return TrainingConfig(**config_dict)
+
+
+# =================== MPS OPTIMIZATIONS ===================
+
+def optimize_for_device(device_type: str) -> bool:
+    """Apply device-specific optimizations"""
+    if device_type == "mps":
+        os.environ['PYTORCH_MPS_HIGH_WATERMARK_RATIO'] = '0.0'
+        os.environ['PYTORCH_ENABLE_MPS_FALLBACK'] = '1'
+        os.environ['PYTORCH_MPS_PROFILE'] = '0'
+        return True
+    elif device_type == "cuda":
+        torch.backends.cudnn.benchmark = True
+        torch.backends.cudnn.deterministic = False
+        return True
+    return False
+
+
+# =================== AUGMENTATION UTILITIES ===================
+
+def mixup_data(x, y, alpha=1.0):
+    """Mixup augmentation"""
+    if alpha > 0:
+        lam = np.random.beta(alpha, alpha)
+    else:
+        lam = 1
+    
+    batch_size = x.size(0)
+    index = torch.randperm(batch_size).to(x.device)
+    
+    mixed_x = lam * x + (1 - lam) * x[index, :]
+    y_a, y_b = y, y[index]
+    return mixed_x, y_a, y_b, lam
+
+
+def cutmix_data(x, y, alpha=1.0):
+    """CutMix augmentation adapted for video data"""
+    if alpha <= 0:
+        return x, y, y, 1
+    
+    lam = np.random.beta(alpha, alpha)
+    batch_size = x.size(0)
+    index = torch.randperm(batch_size).to(x.device)
+    
+    # For video data: (B, C, T, H, W)
+    _, _, T, H, W = x.shape
+    
+    # Generate random box
+    cut_rat = np.sqrt(1. - lam)
+    cut_w = int(W * cut_rat)
+    cut_h = int(H * cut_rat)
+    
+    cx = np.random.randint(W)
+    cy = np.random.randint(H)
+    
+    bbx1 = np.clip(cx - cut_w // 2, 0, W)
+    bby1 = np.clip(cy - cut_h // 2, 0, H)
+    bbx2 = np.clip(cx + cut_w // 2, 0, W)
+    bby2 = np.clip(cy + cut_h // 2, 0, H)
+    
+    x[:, :, :, bby1:bby2, bbx1:bbx2] = x[index, :, :, bby1:bby2, bbx1:bbx2]
+    
+    # Adjust lambda to exactly match pixel ratio
+    lam = 1 - ((bbx2 - bbx1) * (bby2 - bby1) / (W * H))
+    
+    y_a, y_b = y, y[index]
+    return x, y_a, y_b, lam
+
+
+# =================== IMPROVED DATASET CLASS ===================
+
+class ImprovedVideoDataset(Dataset):
+    """Enhanced dataset with caching, memory management, and statistics"""
+    
+    def __init__(self, data_paths: List[Tuple[Path, int]], 
+                 cache_strategy: str = "selective",
+                 cache_threshold: int = 1000,
+                 apply_augmentation: bool = False,
+                 augmentation_config: dict = None,
+                 logger: logging.Logger = None):
+        
+        self.data_paths = data_paths
+        self.cache = {}
+        self.cache_hits = 0
+        self.cache_misses = 0
+        self.apply_augmentation = apply_augmentation
+        self.augmentation_config = augmentation_config or {}
+        self.logger = logger or logging.getLogger(__name__)
+        
+        # Analyze dataset
+        self._analyze_dataset()
+        
+        # Setup caching strategy
+        if cache_strategy == "all" or (cache_strategy == "selective" and len(data_paths) < cache_threshold):
+            self._preload_all()
+        elif cache_strategy == "selective":
+            self._selective_cache(min(200, len(data_paths) // 5))  # Cache more for small datasets
+    
+    def _analyze_dataset(self):
+        """Analyze dataset composition"""
+        label_counts = {}
+        for _, label in self.data_paths:
+            label_counts[label] = label_counts.get(label, 0) + 1
+        
+        self.logger.info(f"Dataset Analysis:")
+        self.logger.info(f"  Total samples: {len(self.data_paths)}")
+        self.logger.info(f"  Classes: {len(label_counts)}")
+        self.logger.info(f"  Samples per class: {list(label_counts.values())}")
+        
+        # Check balance
+        min_samples = min(label_counts.values())
+        max_samples = max(label_counts.values())
+        balance_ratio = min_samples / max_samples if max_samples > 0 else 0
+        
+        if balance_ratio < 0.8:
+            self.logger.warning(f"Dataset imbalance detected! Ratio: {balance_ratio:.2f}")
         else:
-            if self.sampling_strategy == 'uniform':
-                # Uniform sampling across video
-                indices = np.linspace(0, total_frames - 1, self.num_frames, dtype=int)
-            elif self.sampling_strategy == 'random':
-                # Random sampling with temporal order preserved
-                indices = sorted(np.random.choice(total_frames, self.num_frames, replace=False))
-            elif self.sampling_strategy == 'center':
-                # Sample from center of video
-                center = total_frames // 2
-                start = max(0, center - self.num_frames // 2)
-                end = min(total_frames, start + self.num_frames)
-                indices = np.arange(start, end)
-                if len(indices) < self.num_frames:
-                    indices = np.linspace(0, total_frames - 1, self.num_frames, dtype=int)
-            else:
-                raise ValueError(f"Unknown sampling strategy: {self.sampling_strategy}")
+            self.logger.info(f"Dataset is well balanced. Ratio: {balance_ratio:.2f}")
         
-        sampled = frames[indices]
-        
-        # Verify output
-        if sampled.shape[0] != self.num_frames:
-            raise ValueError(f"Frame sampling failed: got {sampled.shape[0]} frames, expected {self.num_frames}")
-        
-        # Ensure uint8 dtype
-        if sampled.dtype != np.uint8:
-            sampled = sampled.astype(np.uint8)
-        
-        return sampled
+        # Small dataset warning
+        avg_samples = len(self.data_paths) / len(label_counts)
+        if avg_samples < 200:
+            self.logger.warning(f"Small dataset detected: {avg_samples:.1f} avg samples/class")
+            self.logger.info("  Recommendation: Use frozen backbone and high regularization")
     
-    def apply_augmentation(self, frames: np.ndarray) -> np.ndarray:
-        """Apply temporal and spatial augmentations"""
-        if not self.augment:
-            return frames
+    def _preload_all(self):
+        """Preload all tensors with progress tracking"""
+        self.logger.info(f"Preloading all {len(self.data_paths)} tensors...")
         
-        # Ensure frames are uint8
-        if frames.dtype != np.uint8:
-            frames = frames.astype(np.uint8)
+        for idx, (path, label) in enumerate(tqdm(self.data_paths, desc="Preloading")):
+            try:
+                tensor = torch.load(path, map_location='cpu')
+                # Convert to half precision for memory efficiency
+                if tensor.dtype == torch.float32:
+                    tensor = tensor.half()
+                self.cache[idx] = (tensor, label)
+            except Exception as e:
+                self.logger.error(f"Failed to load {path}: {e}")
+                raise
         
-        # Temporal augmentation
-        if random.random() < 0.3:
-            # Temporal jitter - slightly shift frame sampling
-            shift = random.randint(-2, 2)
-            frames = np.roll(frames, shift, axis=0)
-        
-        # Spatial augmentations
-        if random.random() < 0.5:
-            # Random horizontal flip (be careful with sign language!)
-            # Only apply if gesture is symmetric
-            frames = frames[:, :, ::-1, :]
-        
-        if random.random() < 0.3:
-            # Color jitter
-            factor = random.uniform(0.8, 1.2)
-            frames = np.clip(frames.astype(np.float32) * factor, 0, 255).astype(np.uint8)
-        
-        if random.random() < 0.2:
-            # Random rotation (small angles only)
-            angle = random.uniform(-10, 10)
-            for i in range(len(frames)):
-                center = (112, 112)  # 224/2
-                M = cv2.getRotationMatrix2D(center, angle, 1.0)
-                frames[i] = cv2.warpAffine(frames[i], M, (224, 224))
-        
-        # Ensure output is uint8
-        return frames.astype(np.uint8)
+        self.logger.info(f"Preloaded {len(self.cache)} tensors")
     
-    def normalize_frames(self, frames: np.ndarray) -> torch.Tensor:
-        """Normalize frames for VideoMAE input"""
-        # Verify input shape
-        assert frames.shape == (self.num_frames, 224, 224, 3), \
-            f"Expected frames shape (16, 224, 224, 3), got {frames.shape}"
+    def _selective_cache(self, sample_size: int):
+        """Cache a subset of data for performance"""
+        indices = random.sample(range(len(self.data_paths)), sample_size)
         
-        # Convert to float and normalize to [0, 1]
-        frames = frames.astype(np.float32) / 255.0
-        
-        # Apply ImageNet normalization (VideoMAE standard)
-        # Reshape mean and std for broadcasting
-        mean = self.mean.reshape(1, 1, 1, 3)
-        std = self.std.reshape(1, 1, 1, 3)
-        frames = (frames - mean) / std
-        
-        # Convert to tensor with shape (T, H, W, C)
-        frames = torch.from_numpy(frames).float()
-        
-        # Permute to (C, T, H, W) for VideoMAE
-        # From: (num_frames, height, width, channels)
-        # To: (channels, num_frames, height, width)
-        frames = frames.permute(3, 0, 1, 2)
-        
-        # Verify output shape
-        assert frames.shape == (3, self.num_frames, 224, 224), \
-            f"Expected output shape (3, 16, 224, 224), got {frames.shape}"
-        
-        return frames
+        self.logger.info(f"Caching {sample_size} sample tensors...")
+        for idx in tqdm(indices, desc="Selective caching"):
+            path, label = self.data_paths[idx]
+            try:
+                tensor = torch.load(path, map_location='cpu')
+                if tensor.dtype == torch.float32:
+                    tensor = tensor.half()
+                self.cache[idx] = (tensor, label)
+            except Exception as e:
+                self.logger.error(f"Failed to load {path}: {e}")
     
     def __len__(self):
-        return len(self.video_paths)
-    
-    def process_frames_with_processor(self, frames: np.ndarray) -> torch.Tensor:
-        """Process frames using VideoMAE processor"""
-        # VideoMAEImageProcessor expects:
-        # - List of numpy arrays (each frame separately)
-        # - Values in range 0-255 (uint8)
-        # - Shape per frame: (H, W, C)
-        
-        # Ensure correct dtype
-        if frames.dtype != np.uint8:
-            frames = np.clip(frames, 0, 255).astype(np.uint8)
-        
-        # Verify shape
-        assert frames.shape == (self.num_frames, 224, 224, 3), \
-            f"Expected frames shape ({self.num_frames}, 224, 224, 3), got {frames.shape}"
-        
-        # Convert frames to list format for processor
-        frames_list = [frames[i] for i in range(len(frames))]
-        
-        # Process with VideoMAE processor
-        # This handles normalization and tensor conversion
-        processed = self.processor(
-            frames_list,
-            return_tensors="pt"
-        )
-        
-        # The processor returns a batch tensor, we need to squeeze it
-        # From (1, C, T, H, W) to (C, T, H, W)
-        pixel_values = processed['pixel_values'].squeeze(0)
-
-        print(f"pixel_values : {pixel_values.shape}")
-
-        # # Check the actual shape and handle accordingly
-        # if pixel_values.shape == (self.num_frames, 3, 224, 224):
-        #     # Shape is (T, C, H, W), need to convert to (C, T, H, W)
-        #     pixel_values = pixel_values.permute(1, 0, 2, 3)
-        # elif pixel_values.shape != (3, self.num_frames, 224, 224):
-        #     # If it's neither expected shape, there's a problem
-        #     raise ValueError(f"Unexpected shape from processor: {pixel_values.shape}")
-        
-        # Verify output shape
-        expected_shape = (self.num_frames, 3, 224, 224)
-        assert pixel_values.shape == expected_shape, \
-            f"Processor output shape {pixel_values.shape} doesn't match expected {expected_shape}"
-        
-        return pixel_values
+        return len(self.data_paths)
     
     def __getitem__(self, idx):
+        if idx in self.cache:
+            self.cache_hits += 1
+            tensor, label = self.cache[idx]
+            return tensor.float(), label
+        
+        self.cache_misses += 1
+        path, label = self.data_paths[idx]
+        
         try:
-            # Load video
-            video_path = self.video_paths[idx]
-            frames = self.load_video(video_path)
-            
-            # Sample frames
-            frames = self.sample_frames(frames)
-            
-            # Apply augmentation
-            frames = self.apply_augmentation(frames)
-            
-            # Process frames
-            if self.processor is not None:
-                pixel_values = self.process_frames_with_processor(frames)
-            else:
-                pixel_values = self.normalize_frames(frames)
-            
-            # Get label
-            label = torch.tensor(self.labels[idx], dtype=torch.long)
-            
-            return {
-                'pixel_values': pixel_values,
-                'labels': label
-            }
+            tensor = torch.load(path, map_location='cpu')
+            tensor = tensor.permute(1, 0, 2, 3)     # (T,C,H,W) -> (C,T,H,W)
+            return tensor.float(), label
         except Exception as e:
-            print(f"\nError processing video {self.video_paths[idx]}:")
-            print(f"  {str(e)}")
-            raise
-
-
-class VideoMAETrainer:
-    """
-    Complete training pipeline for VideoMAE gesture recognition
-    """
+            self.logger.error(f"Failed to load {path}: {e}")
+            # Return a zero tensor with correct shape for VideoMAE-Small
+            return torch.zeros((3, 16, 224, 224)), label
     
-    def __init__(self,
-                 data_root: Path = INPUT_ROOT,
-                 out_root: Path = OUTPUT_ROOT,
-                 num_classes: int = 10,
-                 num_channels: int = 3,
-                 num_frames: int = 16,
-                 batch_size: int = 8,
-                 learning_rate: float = 5e-5,
-                 num_epochs: int = 30,
-                 device: str = 'auto',
-                 seed: int = 42):
-        """
-        Initialize VideoMAE trainer with specifications matching 
-        MediaPipe preprocessed videos (224x224 RGB)
-        """
-        self.data_root = Path(data_root)
-        self.out_root  = Path(out_root)
-        self.num_classes = num_classes
-        self.num_frames = num_frames
-        self.batch_size = batch_size
-        self.learning_rate = learning_rate
-        self.num_epochs = num_epochs
-        self.num_channels = num_channels
-        
-        # Auto-detect best available device
-        if device == 'auto':
-            if torch.cuda.is_available():
-                self.device = torch.device('cuda')
-            elif torch.backends.mps.is_available():
-                self.device = torch.device('mps')
-            else:
-                self.device = torch.device('cpu')
-        else:
-            self.device = torch.device(device)
-        
-        self.seed = seed
-        
-        # Set random seeds
-        self.set_seed(seed)
-        
-        # Initialize model
-        self.initialize_model()
-        
-        # Training history
-        self.history = defaultdict(list)
-        
-        # Best model tracking
-        self.best_val_acc = 0
-        self.best_model_state = None
-        
-    def set_seed(self, seed: int):
-        """Set random seeds for reproducibility"""
-        random.seed(seed)
-        np.random.seed(seed)
-        torch.manual_seed(seed)
-        torch.cuda.manual_seed_all(seed)
-        torch.backends.cudnn.deterministic = True
-        torch.backends.cudnn.benchmark = False
-    
-    def initialize_model(self):
-        """
-        Initialize VideoMAE model with proper configuration
-        for 224x224 input videos
-        """
-        # Load pre-trained VideoMAE
-        model_name = "MCG-NJU/videomae-base"
-        
-        # Load the base configuration first
-        config = VideoMAEConfig.from_pretrained(model_name)
-        
-        # Only modify what we need to change
-        config.hidden_dropout_prob = 0.3
-        config.attention_probs_dropout_prob = 0.3
-        
-        # Print what the model expects
-        print(f"\nModel Configuration:")
-        print(f"  Expected channels: {config.num_channels}")
-        print(f"  Expected frames: {config.num_frames}")
-        print(f"  Image size: {config.image_size}")
-        print(f"  Patch size: {config.patch_size}")
-        print(f"  Tubelet size: {config.tubelet_size}")
-        
-        # Initialize model (this will show the weight initialization warning which is normal)
-        self.model = VideoMAEForVideoClassification.from_pretrained(
-            model_name,
-            config=config,
-            ignore_mismatched_sizes=True  # Important for different num_classes
-        )
-        
-        # Move to device
-        self.model = self.model.to(self.device)
-        
-        # Initialize processor (handles normalization)
-        self.processor = VideoMAEImageProcessor.from_pretrained(model_name)
-        
-        # Store config for reference
-        self.model_config = config
-        
-        print(f"Model initialized on {self.device}")
-        print(f"Model expects: {self.num_frames} frames of {config.image_size}x{config.image_size} RGB")
-        print(f"Number of parameters: {sum(p.numel() for p in self.model.parameters()):,}")
-        print("Note: Weight initialization warning for classifier is normal - we're fine-tuning for new classes")
-    
-    def load_data(self) -> Tuple[List, List, Dict]:
-        """Load video paths and labels from directory structure"""
-        video_paths = []
-        labels = []
-        class_names = {}
-        
-        # Iterate through class folders
-        for class_idx, class_dir in enumerate(sorted(self.data_root.iterdir())):
-            if class_dir.is_dir():
-                class_names[class_idx] = class_dir.name
-                
-                # Get all videos in class
-                for video_path in class_dir.glob("*.mp4"):
-                    video_paths.append(video_path)
-                    labels.append(class_idx)
-        
-        print(f"Loaded {len(video_paths)} videos from {len(class_names)} classes")
-        return video_paths, labels, class_names
-    
-    def create_stratified_splits(self, 
-                                video_paths: List, 
-                                labels: List, 
-                                n_splits: int = 5) -> List[Dict]:
-        """
-        Create stratified k-fold splits for cross-validation
-        Better for VideoMAE because:
-        1. Ensures each fold has balanced class distribution
-        2. Provides robust performance estimation
-        3. Helps detect overfitting on small datasets
-        """
-        skf = StratifiedKFold(n_splits=n_splits, shuffle=True, random_state=self.seed)
-        splits = []
-        
-        for fold_idx, (train_idx, val_idx) in enumerate(skf.split(video_paths, labels)):
-            splits.append({
-                'fold': fold_idx,
-                'train_paths': [video_paths[i] for i in train_idx],
-                'train_labels': [labels[i] for i in train_idx],
-                'val_paths': [video_paths[i] for i in val_idx],
-                'val_labels': [labels[i] for i in val_idx]
-            })
-        
-        return splits
-    
-    def train_fold(self, fold_data: Dict, fold_idx: int) -> Dict:
-        """Train a single fold"""
-
-        fold_dir = self.out_root / f"fold_{fold_idx}"
-        fold_dir.mkdir(parents=True, exist_ok=True)
-
-        print(f"\n{'='*50}")
-        print(f"Training Fold {fold_idx + 1}")
-        print(f"{'='*50}")
-        
-        # Create datasets
-        train_dataset = VideoGestureDataset(
-            video_paths=fold_data['train_paths'],
-            labels=fold_data['train_labels'],
-            num_frames=self.num_frames,
-            sampling_strategy='uniform',
-            processor=self.processor,
-            augment=True
-        )
-        
-        val_dataset = VideoGestureDataset(
-            video_paths=fold_data['val_paths'],
-            labels=fold_data['val_labels'],
-            num_frames=self.num_frames,
-            sampling_strategy='center',  # More consistent for validation
-            processor=self.processor,
-            augment=False
-        )
-        
-        # Create dataloaders with device-appropriate settings
-        num_workers = 0
-        pin_memory = self.device.type == 'cuda'
-        
-        train_loader = DataLoader(
-            train_dataset,
-            batch_size=self.batch_size,
-            shuffle=True,
-            num_workers=num_workers,
-            pin_memory=pin_memory
-        )
-        
-        val_loader = DataLoader(
-            val_dataset,
-            batch_size=self.batch_size,
-            shuffle=False,
-            num_workers=num_workers,
-            pin_memory=pin_memory
-        )
-        
-        # Setup optimizer and scheduler
-        optimizer = optim.AdamW(
-            self.model.parameters(),
-            lr=self.learning_rate,
-            weight_decay=0.05,
-            betas=(0.9, 0.999)
-        )
-        
-        # Cosine annealing with warm restarts
-        scheduler = optim.lr_scheduler.CosineAnnealingWarmRestarts(
-            optimizer,
-            T_0=5,
-            T_mult=2,
-            eta_min=1e-6
-        )
-        
-        # Mixed precision training (only for CUDA)
-        use_amp = self.device.type == 'cuda'
-        scaler = GradScaler() if use_amp else None
-        
-        # Training metrics for this fold
-        fold_history = {
-            'train_loss': [],
-            'train_acc': [],
-            'val_loss': [],
-            'val_acc': [],
-            'lr': []
+    def get_cache_stats(self):
+        """Get caching statistics"""
+        total_accesses = self.cache_hits + self.cache_misses
+        hit_rate = self.cache_hits / total_accesses if total_accesses > 0 else 0
+        return {
+            'cache_hits': self.cache_hits,
+            'cache_misses': self.cache_misses,
+            'hit_rate': hit_rate,
+            'cached_items': len(self.cache)
         }
+
+
+# =================== ENHANCED MODEL CLASS FOR VIDEOMAE-SMALL-KINETICS ===================
+
+class EnhancedVideoMAESmallKinetics(nn.Module):
+    """Enhanced VideoMAE-Small-Kinetics optimized for small datasets"""
+    
+    def __init__(self, config: TrainingConfig, num_classes: int, logger: logging.Logger = None):
+        super().__init__()
+        self.config = config
+        self.num_classes = num_classes
+        self.logger = logger or logging.getLogger(__name__)
         
-        best_val_acc = 0
-        patience = 5
-        patience_counter = 0
+        # Load the pre-trained Kinetics model
+        self.logger.info(f"Loading pre-trained model: {config.model_name}")
+        try:
+            self.model = VideoMAEForVideoClassification.from_pretrained(
+                config.model_name,
+                ignore_mismatched_sizes=True,
+                torch_dtype=torch.float32  # Ensure float32 for stability
+            )
+            self.logger.info("Successfully loaded VideoMAE-Small-Finetuned-Kinetics")
+        except Exception as e:
+            self.logger.error(f"Failed to load model: {e}")
+            raise
         
-        for epoch in range(self.num_epochs):
-            # Training phase
-            self.model.train()
-            train_loss = 0
-            train_correct = 0
-            train_total = 0
+        # Get model configuration for architecture details
+        self.model_config = self.model.config
+        hidden_size = self.model_config.hidden_size  # Should be 384 for small model
+        
+        self.logger.info(f"Model Configuration:")
+        self.logger.info(f"  Hidden size: {hidden_size}")
+        self.logger.info(f"  Num attention heads: {self.model_config.num_attention_heads}")
+        self.logger.info(f"  Num hidden layers: {self.model_config.num_hidden_layers}")
+        self.logger.info(f"  Original num labels: {self.model_config.num_labels}")
+        
+        # Replace classifier for your number of classes
+        self._build_classifier(hidden_size, num_classes)
+        
+        # Apply freezing strategy
+        self._apply_freezing_strategy()
+        
+        # Add label smoothing loss
+        if config.label_smoothing > 0:
+            self.criterion = nn.CrossEntropyLoss(label_smoothing=config.label_smoothing)
+            self.logger.info(f"Using label smoothing: {config.label_smoothing}")
+        else:
+            self.criterion = nn.CrossEntropyLoss()
+        
+        # Log model statistics
+        self._log_model_stats()
+    
+    def _build_classifier(self, hidden_size: int, num_classes: int):
+        """Build appropriate classifier based on configuration"""
+        if self.config.use_feature_extractor_mode:
+            # Simple linear classifier for maximum stability
+            self.model.classifier = nn.Sequential(
+                nn.Dropout(self.config.dropout_rate),
+                nn.Linear(hidden_size, num_classes)
+            )
+            self.logger.info("Using simple feature extractor classifier")
             
-            pbar = tqdm(train_loader, desc=f"Epoch {epoch+1}/{self.num_epochs}")
-            for batch_idx, batch in enumerate(pbar):
-                pixel_values = batch['pixel_values'].to(self.device)
-                labels = batch['labels'].to(self.device)
+        else:
+            # Two-layer classifier with more capacity
+            self.model.classifier = nn.Sequential(
+                nn.Dropout(self.config.dropout_rate),
+                nn.Linear(hidden_size, hidden_size // 2),
+                nn.GELU(),
+                nn.Dropout(self.config.dropout_rate / 2),
+                nn.Linear(hidden_size // 2, num_classes)
+            )
+            self.logger.info("Using two-layer classifier")
+    
+    def _apply_freezing_strategy(self):
+        """Apply freezing strategy optimized for small datasets"""
+        
+        if self.config.freeze_backbone:
+            self.logger.info("Freezing backbone - training only classifier")
+            
+            # Freeze all parameters except classifier
+            for name, param in self.model.named_parameters():
+                if "classifier" not in name:
+                    param.requires_grad = False
+            
+            # Progressive unfreezing option
+            if self.config.progressive_unfreezing and hasattr(self.config, 'freeze_layers_from'):
+                if self.config.freeze_layers_from < 0:
+                    layers_to_unfreeze = abs(self.config.freeze_layers_from)
+                    self.logger.info(f"Unfreezing last {layers_to_unfreeze} encoder layers")
+                    
+                    # Access encoder layers through VideoMAE structure
+                    if hasattr(self.model, 'videomae') and hasattr(self.model.videomae, 'encoder'):
+                        encoder_layers = self.model.videomae.encoder.layer
+                        for layer in encoder_layers[-layers_to_unfreeze:]:
+                            for param in layer.parameters():
+                                param.requires_grad = True
+                                
+        else:
+            self.logger.info("Training all parameters (full fine-tuning)")
+            self.logger.warning("Full fine-tuning with small dataset - monitor for overfitting!")
+    
+    def _log_model_stats(self):
+        """Log detailed model parameter statistics"""
+        trainable_params = sum(p.numel() for p in self.model.parameters() if p.requires_grad)
+        total_params = sum(p.numel() for p in self.model.parameters())
+        frozen_params = total_params - trainable_params
+        
+        self.logger.info(f"Model Statistics:")
+        self.logger.info(f"  Model: {self.config.model_name}")
+        self.logger.info(f"  Architecture: VideoMAE-Small (384 hidden)")
+        self.logger.info(f"  Output classes: {self.num_classes}")
+        self.logger.info(f"  Total parameters: {total_params:,}")
+        self.logger.info(f"  Trainable parameters: {trainable_params:,} ({100*trainable_params/total_params:.1f}%)")
+        self.logger.info(f"  Frozen parameters: {frozen_params:,} ({100*frozen_params/total_params:.1f}%)")
+        
+        # Calculate parameter-to-sample ratio
+        estimated_samples = self.num_classes * 145  # Assuming ~145 samples per class
+        param_sample_ratio = trainable_params / estimated_samples
+        self.logger.info(f"  Parameter-to-sample ratio: {param_sample_ratio:.1f}:1")
+        
+        if param_sample_ratio > 10:
+            self.logger.warning("  High parameter-to-sample ratio - overfitting risk!")
+        elif param_sample_ratio < 0.1:
+            self.logger.info("  Low parameter-to-sample ratio - good for generalization")
+        
+        # Memory estimation
+        param_size_gb = total_params * 4 / (1024**3)
+        self.logger.info(f"  Estimated parameter memory: {param_size_gb:.2f} GB")
+        
+        # Strategy summary
+        if self.config.freeze_backbone:
+            if self.config.use_feature_extractor_mode:
+                strategy = "Feature extraction (minimal fine-tuning)"
+            else:
+                strategy = "Frozen backbone with classifier training"
+        else:
+            strategy = "Full fine-tuning"
+        
+        self.logger.info(f"  Training strategy: {strategy}")
+    
+    def forward(self, pixel_values, labels=None, apply_augmentation=False, config=None):
+        """Enhanced forward pass with augmentation support"""
+        
+        # Apply augmentations during training
+        if apply_augmentation and config and self.training:
+            if np.random.random() < config.augmentation_prob:
+                # Randomly choose between mixup and cutmix
+                if np.random.random() < 0.5 and config.mixup_alpha > 0:
+                    pixel_values, labels_a, labels_b, lam = mixup_data(
+                        pixel_values, labels, config.mixup_alpha
+                    )
+                    outputs = self.model(pixel_values=pixel_values)
+                    
+                    # Mixed loss for mixup
+                    loss_a = self.criterion(outputs.logits, labels_a)
+                    loss_b = self.criterion(outputs.logits, labels_b)
+                    loss = lam * loss_a + (1 - lam) * loss_b
+                    
+                    # Create custom output
+                    class CustomOutput:
+                        def __init__(self, logits, loss):
+                            self.logits = logits
+                            self.loss = loss
+                    
+                    return CustomOutput(outputs.logits, loss)
                 
-                # Debug shape on first batch
-                if epoch == 0 and batch_idx == 0:
-                    print(f"\nDebug - First batch shapes:")
-                    print(f"  pixel_values: {pixel_values.shape}")
-                    print(f"  Expected: (batch_size, 3, 16, 224, 224)")
-                    print(f"  labels: {labels.shape}")
-                
-                optimizer.zero_grad()
-                
-                # Forward pass with or without mixed precision
-                if use_amp:
-                    with autocast():
-                        outputs = self.model(pixel_values=pixel_values, labels=labels)
-                        loss = outputs.loss
+                elif config.cutmix_alpha > 0:
+                    pixel_values, labels_a, labels_b, lam = cutmix_data(
+                        pixel_values, labels, config.cutmix_alpha
+                    )
+                    outputs = self.model(pixel_values=pixel_values)
+                    
+                    # Mixed loss for cutmix
+                    loss_a = self.criterion(outputs.logits, labels_a)
+                    loss_b = self.criterion(outputs.logits, labels_b)
+                    loss = lam * loss_a + (1 - lam) * loss_b
+                    
+                    # Create custom output
+                    class CustomOutput:
+                        def __init__(self, logits, loss):
+                            self.logits = logits
+                            self.loss = loss
+                    
+                    return CustomOutput(outputs.logits, loss)
+        
+        # Standard forward pass
+        if labels is not None:
+            outputs = self.model(pixel_values=pixel_values)
+            # Use custom loss function if specified
+            if hasattr(self, 'criterion'):
+                loss = self.criterion(outputs.logits, labels)
+                # Create custom output with our loss
+                class CustomOutput:
+                    def __init__(self, logits, loss):
+                        self.logits = logits
+                        self.loss = loss
+                return CustomOutput(outputs.logits, loss)
+            else:
+                return self.model(pixel_values=pixel_values, labels=labels)
+        else:
+            return self.model(pixel_values=pixel_values)
+
+
+# =================== ENHANCED TRAINING FUNCTIONS ===================
+
+class EarlyStopping:
+    """Enhanced early stopping utility"""
+    def __init__(self, patience: int = 5, min_delta: float = 0.001, restore_best_weights: bool = True):
+        self.patience = patience
+        self.min_delta = min_delta
+        self.restore_best_weights = restore_best_weights
+        self.best_score = None
+        self.best_weights = None
+        self.counter = 0
+        self.early_stop = False
+    
+    def __call__(self, score: float, model: nn.Module = None):
+        if self.best_score is None:
+            self.best_score = score
+            if model and self.restore_best_weights:
+                self.best_weights = model.state_dict().copy()
+        elif score < self.best_score + self.min_delta:
+            self.counter += 1
+            if self.counter >= self.patience:
+                self.early_stop = True
+        else:
+            self.best_score = score
+            self.counter = 0
+            if model and self.restore_best_weights:
+                self.best_weights = model.state_dict().copy()
+    
+    def restore_best_model(self, model: nn.Module):
+        """Restore the best model weights"""
+        if self.best_weights:
+            model.load_state_dict(self.best_weights)
+
+
+def create_optimizer_and_scheduler(model, config: TrainingConfig, num_training_steps: int):
+    """Create optimizer and learning rate scheduler optimized for VideoMAE-Small"""
+    
+    # Different learning rates for different components
+    if config.freeze_backbone:
+        # Only classifier parameters are trainable
+        trainable_params = [p for p in model.parameters() if p.requires_grad]
+        
+        optimizer = torch.optim.AdamW(
+            trainable_params,
+            lr=config.learning_rate,
+            weight_decay=config.weight_decay,
+            betas=(0.9, 0.999),
+            eps=1e-8
+        )
+        
+    else:
+        # Differentiated learning rates for full fine-tuning
+        backbone_params = []
+        classifier_params = []
+        
+        for name, param in model.named_parameters():
+            if param.requires_grad:
+                if "classifier" in name:
+                    classifier_params.append(param)
                 else:
-                    outputs = self.model(pixel_values=pixel_values, labels=labels)
-                    loss = outputs.loss
-                
-                # Backward pass
-                if use_amp:
-                    scaler.scale(loss).backward()
-                    # Gradient clipping
-                    scaler.unscale_(optimizer)
-                    torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
-                    scaler.step(optimizer)
-                    scaler.update()
-                else:
-                    loss.backward()
-                    torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
-                    optimizer.step()
-                
-                # Calculate accuracy
-                predictions = torch.argmax(outputs.logits, dim=-1)
-                train_correct += (predictions == labels).sum().item()
-                train_total += labels.size(0)
-                train_loss += loss.item()
-                
-                # Update progress bar
-                pbar.set_postfix({
-                    'loss': f"{loss.item():.4f}",
-                    'acc': f"{train_correct/train_total:.4f}"
-                })
+                    backbone_params.append(param)
+        
+        optimizer = torch.optim.AdamW([
+            {'params': backbone_params, 'lr': config.learning_rate * 0.1},  # Lower LR for pre-trained backbone
+            {'params': classifier_params, 'lr': config.learning_rate}        # Higher LR for new classifier
+        ], weight_decay=config.weight_decay, betas=(0.9, 0.999), eps=1e-8)
+    
+    # Create scheduler
+    if config.use_cosine_annealing:
+        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+            optimizer, 
+            T_max=config.epochs,
+            eta_min=config.learning_rate * 0.01
+        )
+    else:
+        # StepLR as alternative
+        scheduler = torch.optim.lr_scheduler.StepLR(
+            optimizer,
+            step_size=config.epochs // 3,
+            gamma=0.1
+        )
+    
+    # Add warmup scheduler if requested
+    if config.use_warmup and config.warmup_steps > 0:
+        from torch.optim.lr_scheduler import LambdaLR
+        
+        def warmup_lambda(step):
+            if step < config.warmup_steps:
+                return step / config.warmup_steps
+            return 1.0
+        
+        warmup_scheduler = LambdaLR(optimizer, lr_lambda=warmup_lambda)
+        return optimizer, scheduler, warmup_scheduler
+    
+    return optimizer, scheduler
+
+
+def train_epoch_enhanced(model, dataloader, optimizer, scheduler, config: TrainingConfig, 
+                        device, epoch: int, logger: logging.Logger, warmup_scheduler=None):
+    """Enhanced training loop with advanced features"""
+    model.train()
+    total_loss = 0
+    correct = 0
+    total = 0
+    num_batches = len(dataloader)
+    
+    # Mixed precision scaler
+    scaler = torch.cuda.amp.GradScaler() if config.mixed_precision and device.type == "cuda" else None
+    
+    optimizer.zero_grad()
+    
+    pbar = tqdm(dataloader, desc=f"Epoch {epoch+1} Training")
+    for batch_idx, (videos, labels) in enumerate(pbar):
+        videos = videos.to(device, non_blocking=True)
+        labels = labels.to(device, non_blocking=True)
+        
+        # Apply warmup scheduler
+        if warmup_scheduler and epoch == 0:
+            warmup_scheduler.step()
+        
+        # Mixed precision forward pass with augmentation
+        if config.mixed_precision and device.type == "cuda":
+            with torch.cuda.amp.autocast():
+                outputs = model(
+                    pixel_values=videos, 
+                    labels=labels,
+                    apply_augmentation=True,
+                    config=config
+                )
+                loss = outputs.loss / config.gradient_accumulation_steps
+        else:
+            outputs = model(
+                pixel_values=videos, 
+                labels=labels,
+                apply_augmentation=True,
+                config=config
+            )
+            loss = outputs.loss / config.gradient_accumulation_steps
+        
+        # Backward pass
+        if scaler is not None:
+            scaler.scale(loss).backward()
+        else:
+            loss.backward()
+        
+        # Gradient accumulation and clipping
+        if (batch_idx + 1) % config.gradient_accumulation_steps == 0:
+            if scaler is not None:
+                scaler.unscale_(optimizer)
+                torch.nn.utils.clip_grad_norm_(model.parameters(), config.max_grad_norm)
+                scaler.step(optimizer)
+                scaler.update()
+            else:
+                torch.nn.utils.clip_grad_norm_(model.parameters(), config.max_grad_norm)
+                optimizer.step()
             
-            # Validation phase
-            self.model.eval()
-            val_loss = 0
-            val_correct = 0
-            val_total = 0
-            all_predictions = []
-            all_labels = []
+            optimizer.zero_grad()
+        
+        # Statistics
+        total_loss += outputs.loss.item()
+        with torch.no_grad():
+            predicted = outputs.logits.argmax(dim=1)
+            total += labels.size(0)
+            correct += predicted.eq(labels).sum().item()
+        
+        # Update progress bar
+        current_acc = 100. * correct / total
+        current_lr = optimizer.param_groups[0]['lr']
+        pbar.set_postfix({
+            'Loss': f'{total_loss/(batch_idx+1):.3f}',
+            'Acc': f'{current_acc:.1f}%',
+            'LR': f'{current_lr:.2e}'
+        })
+        
+        # Memory cleanup
+        if batch_idx % 50 == 0 and device.type == "mps":
+            torch.mps.synchronize()
+    
+    # Handle remaining gradients
+    if (len(dataloader)) % config.gradient_accumulation_steps != 0:
+        if scaler is not None:
+            scaler.step(optimizer)
+            scaler.update()
+        else:
+            optimizer.step()
+        optimizer.zero_grad()
+    
+    # Step scheduler (not warmup)
+    if warmup_scheduler is None or epoch > 0:
+        scheduler.step()
+    
+    avg_loss = total_loss / num_batches
+    accuracy = 100. * correct / total
+    
+    logger.info(f"Training - Loss: {avg_loss:.4f}, Accuracy: {accuracy:.2f}%")
+    return avg_loss, accuracy
+
+
+def validate_enhanced(model, dataloader, device, epoch: int, logger: logging.Logger, 
+                     return_predictions: bool = False):
+    """Enhanced validation with detailed metrics"""
+    model.eval()
+    total_loss = 0
+    all_preds = []
+    all_labels = []
+    
+    with torch.no_grad():
+        pbar = tqdm(dataloader, desc=f"Epoch {epoch+1} Validation")
+        for videos, labels in pbar:
+            videos = videos.to(device, non_blocking=True)
+            labels = labels.to(device, non_blocking=True)
             
-            with torch.no_grad():
-                for batch in tqdm(val_loader, desc="Validation"):
-                    pixel_values = batch['pixel_values'].to(self.device)
-                    labels = batch['labels'].to(self.device)
-                    
-                    outputs = self.model(pixel_values=pixel_values, labels=labels)
-                    
-                    predictions = torch.argmax(outputs.logits, dim=-1)
-                    
-                    val_loss += outputs.loss.item()
-                    val_correct += (predictions == labels).sum().item()
-                    val_total += labels.size(0)
-                    
-                    all_predictions.extend(predictions.cpu().numpy())
-                    all_labels.extend(labels.cpu().numpy())
+            outputs = model(pixel_values=videos, labels=labels, apply_augmentation=False)
+            total_loss += outputs.loss.item()
             
-            # Calculate epoch metrics
-            train_loss_avg = train_loss / len(train_loader)
-            train_acc = train_correct / train_total
-            val_loss_avg = val_loss / len(val_loader)
-            val_acc = val_correct / val_total
-            current_lr = optimizer.param_groups[0]['lr']
+            preds = outputs.logits.argmax(dim=1)
+            all_preds.extend(preds.cpu().numpy())
+            all_labels.extend(labels.cpu().numpy())
             
-            # Store metrics
-            fold_history['train_loss'].append(train_loss_avg)
-            fold_history['train_acc'].append(train_acc)
-            fold_history['val_loss'].append(val_loss_avg)
-            fold_history['val_acc'].append(val_acc)
-            fold_history['lr'].append(current_lr)
+            # Update progress bar
+            current_acc = accuracy_score(all_labels, all_preds) * 100
+            pbar.set_postfix({
+                'Loss': f'{total_loss/len(all_labels)*len(dataloader.dataset):.3f}',
+                'Acc': f'{current_acc:.1f}%'
+            })
+    
+    avg_loss = total_loss / len(dataloader)
+    accuracy = accuracy_score(all_labels, all_preds) * 100
+    
+    logger.info(f"Validation - Loss: {avg_loss:.4f}, Accuracy: {accuracy:.2f}%")
+    
+    if return_predictions:
+        return avg_loss, accuracy, all_preds, all_labels
+    return avg_loss, accuracy
+
+
+# =================== ENHANCED PLOTTING FUNCTIONS ===================
+
+def plot_fold_training_curves(fold_idx, history, config: TrainingConfig, save_dir: str):
+    """Plot comprehensive training curves for each fold"""
+    fig, axes = plt.subplots(2, 2, figsize=(15, 10))
+    
+    epochs = range(1, len(history['train_loss']) + 1)
+    val_epochs = range(config.val_frequency, len(history['train_loss'])+1, config.val_frequency)
+    val_epochs = list(val_epochs[:len(history['val_loss'])])
+    
+    # Plot 1: Loss curves
+    ax1 = axes[0, 0]
+    ax1.plot(epochs, history['train_loss'], 'b-', linewidth=2, label='Training Loss', alpha=0.8)
+    if history['val_loss']:
+        ax1.plot(val_epochs, history['val_loss'], 'r-o', linewidth=2, label='Validation Loss', 
+                markersize=4, alpha=0.8)
+    
+    ax1.set_xlabel('Epoch')
+    ax1.set_ylabel('Loss')
+    ax1.set_title(f'Fold {fold_idx+1}: Loss Curves')
+    ax1.legend()
+    ax1.grid(True, alpha=0.3)
+    
+    # Plot 2: Accuracy curves
+    ax2 = axes[0, 1]
+    ax2.plot(epochs, history['train_acc'], 'b-', linewidth=2, label='Training Acc', alpha=0.8)
+    if history['val_acc']:
+        ax2.plot(val_epochs, history['val_acc'], 'r-o', linewidth=2, label='Validation Acc',
+                markersize=4, alpha=0.8)
+    
+    ax2.set_xlabel('Epoch')
+    ax2.set_ylabel('Accuracy (%)')
+    ax2.set_title(f'Fold {fold_idx+1}: Accuracy Curves')
+    ax2.set_ylim([0, 100])
+    ax2.legend()
+    ax2.grid(True, alpha=0.3)
+    
+    # Plot 3: Learning rate schedule
+    ax3 = axes[1, 0]
+    if history['learning_rates']:
+        ax3.plot(epochs, history['learning_rates'], 'g-', linewidth=2, alpha=0.8)
+        ax3.set_xlabel('Epoch')
+        ax3.set_ylabel('Learning Rate')
+        ax3.set_title(f'Fold {fold_idx+1}: Learning Rate Schedule')
+        ax3.set_yscale('log')  # Log scale for better visualization
+        ax3.grid(True, alpha=0.3)
+    else:
+        ax3.text(0.5, 0.5, f'Learning Rate: {config.learning_rate}', 
+                ha='center', va='center', transform=ax3.transAxes, fontsize=12)
+        ax3.set_title(f'Fold {fold_idx+1}: Learning Rate')
+    
+    # Plot 4: Training statistics
+    ax4 = axes[1, 1]
+    ax4.axis('off')
+    
+    # Calculate statistics
+    final_train_acc = history['train_acc'][-1]
+    final_val_acc = history['val_acc'][-1] if history['val_acc'] else 0
+    best_val_acc = max(history['val_acc']) if history['val_acc'] else 0
+    overfit_gap = final_train_acc - final_val_acc if history['val_acc'] else 0
+    
+    stats_text = f"""
+    Fold {fold_idx+1} Statistics:
+    
+    Final Training Accuracy: {final_train_acc:.2f}%
+    Final Validation Accuracy: {final_val_acc:.2f}%
+    Best Validation Accuracy: {best_val_acc:.2f}%
+    
+    Overfitting Gap: {overfit_gap:.2f}%
+    
+    Final Training Loss: {history['train_loss'][-1]:.4f}
+    Final Validation Loss: {history['val_loss'][-1]:.4f if history['val_loss'] else 'N/A'}
+    
+    Total Epochs: {len(history['train_loss'])}
+    """
+    
+    ax4.text(0.1, 0.9, stats_text, transform=ax4.transAxes, fontsize=11,
+            verticalalignment='top', fontfamily='monospace',
+            bbox=dict(boxstyle='round,pad=0.5', facecolor='lightblue', alpha=0.8))
+    
+    plt.tight_layout()
+    plot_path = f"{save_dir}/fold_{fold_idx+1}_training_curves.png"
+    plt.savefig(plot_path, dpi=150, bbox_inches='tight')
+    plt.close()
+    
+    return plot_path
+
+
+def plot_confusion_matrix(y_true, y_pred, class_names, fold_idx, save_dir: str):
+    """Plot confusion matrix for the fold"""
+    cm = confusion_matrix(y_true, y_pred)
+    
+    plt.figure(figsize=(max(8, len(class_names)), max(8, len(class_names))))
+    sns.heatmap(cm, annot=True, fmt='d', cmap='Blues',
+                xticklabels=class_names if len(class_names) <= 20 else False, 
+                yticklabels=class_names if len(class_names) <= 20 else False)
+    plt.title(f'Fold {fold_idx+1}: Confusion Matrix')
+    plt.xlabel('Predicted')
+    plt.ylabel('Actual')
+    if len(class_names) <= 20:
+        plt.xticks(rotation=45, ha='right')
+        plt.yticks(rotation=0)
+    plt.tight_layout()
+    
+    plot_path = f"{save_dir}/fold_{fold_idx+1}_confusion_matrix.png"
+    plt.savefig(plot_path, dpi=150, bbox_inches='tight')
+    plt.close()
+    
+    return plot_path
+
+
+def plot_all_folds_summary(all_histories, fold_accuracies, config: TrainingConfig, 
+                          total_time: float, save_dir: str):
+    """Create comprehensive summary plots for all folds"""
+    fig, axes = plt.subplots(2, 2, figsize=(16, 12))
+    
+    # Plot 1: All training curves
+    ax1 = axes[0, 0]
+    for i, hist in enumerate(all_histories):
+        epochs = range(1, len(hist['train_loss']) + 1)
+        ax1.plot(epochs, hist['train_loss'], alpha=0.6, linewidth=1.5, label=f'Fold {i+1}')
+    ax1.set_xlabel('Epoch')
+    ax1.set_ylabel('Training Loss')
+    ax1.set_title('Training Loss - All Folds')
+    ax1.legend()
+    ax1.grid(True, alpha=0.3)
+    
+    # Plot 2: All validation curves
+    ax2 = axes[0, 1]
+    for i, hist in enumerate(all_histories):
+        if hist['val_loss']:
+            val_epochs = range(config.val_frequency, len(hist['train_loss'])+1, config.val_frequency)
+            val_epochs = list(val_epochs[:len(hist['val_loss'])])
+            ax2.plot(val_epochs, hist['val_loss'], 'o-', alpha=0.7, linewidth=1.5, 
+                    markersize=3, label=f'Fold {i+1}')
+    ax2.set_xlabel('Epoch')
+    ax2.set_ylabel('Validation Loss')
+    ax2.set_title('Validation Loss - All Folds')
+    ax2.legend()
+    ax2.grid(True, alpha=0.3)
+    
+    # Plot 3: Fold performance bar chart
+    ax3 = axes[1, 0]
+    bars = ax3.bar(range(1, len(fold_accuracies)+1), fold_accuracies, 
+                   color='skyblue', edgecolor='navy', alpha=0.7)
+    mean_acc = np.mean(fold_accuracies)
+    ax3.axhline(y=mean_acc, color='red', linestyle='--', linewidth=2,
+                label=f'Mean: {mean_acc:.2f}%')
+    
+    # Add value labels on bars
+    for i, (bar, val) in enumerate(zip(bars, fold_accuracies)):
+        height = bar.get_height()
+        ax3.text(bar.get_x() + bar.get_width()/2., height + 0.5,
+                f'{val:.1f}%', ha='center', va='bottom', fontweight='bold')
+    
+    ax3.set_xlabel('Fold')
+    ax3.set_ylabel('Best Validation Accuracy (%)')
+    ax3.set_title('Fold Performance Comparison')
+    ax3.set_xticks(range(1, len(fold_accuracies)+1))
+    ax3.legend()
+    ax3.grid(True, alpha=0.3, axis='y')
+    
+    # Plot 4: Summary statistics
+    ax4 = axes[1, 1]
+    ax4.axis('off')
+    
+    # Calculate comprehensive statistics
+    mean_acc = np.mean(fold_accuracies)
+    std_acc = np.std(fold_accuracies)
+    min_acc = np.min(fold_accuracies)
+    max_acc = np.max(fold_accuracies)
+    
+    final_train_accs = [hist['train_acc'][-1] for hist in all_histories]
+    final_val_accs = [hist['val_acc'][-1] if hist['val_acc'] else 0 for hist in all_histories]
+    mean_train_acc = np.mean(final_train_accs)
+    mean_overfit = np.mean([t - v for t, v in zip(final_train_accs, final_val_accs)])
+    
+    total_epochs = sum(len(h['train_acc']) for h in all_histories)
+    avg_time_per_epoch = total_time / total_epochs if total_epochs > 0 else 0
+    
+    stats_text = f"""
+VIDEOMAE-SMALL-KINETICS SUMMARY
+
+PERFORMANCE METRICS
+Validation Accuracy:
+  Mean: {mean_acc:.2f}% ± {std_acc:.2f}%
+  Range: {min_acc:.2f}% - {max_acc:.2f}%
+  Best Fold: {np.argmax(fold_accuracies)+1} ({max_acc:.2f}%)
+
+Training vs Validation:
+  Final Train Acc: {mean_train_acc:.2f}%
+  Overfitting Gap: {mean_overfit:.2f}%
+
+TIMING STATISTICS
+Total Time: {total_time:.1f} minutes
+Time per Fold: {total_time/len(all_histories):.1f} min
+Time per Epoch: {avg_time_per_epoch:.2f} min
+
+MODEL CONFIGURATION
+Model: VideoMAE-Small-Kinetics
+Backbone: {'Frozen' if config.freeze_backbone else 'Trainable'}
+Batch Size: {config.batch_size}
+Learning Rate: {config.learning_rate}
+Epochs: {config.epochs}
+Augmentation: {'Yes' if config.mixup_alpha > 0 or config.cutmix_alpha > 0 else 'No'}
+    """
+    
+    ax4.text(0.05, 0.95, stats_text, transform=ax4.transAxes, fontsize=9,
+            verticalalignment='top', fontfamily='monospace',
+            bbox=dict(boxstyle='round,pad=0.5', facecolor='lightyellow', alpha=0.9))
+    
+    plt.tight_layout()
+    plot_path = f"{save_dir}/all_folds_comprehensive_summary.png"
+    plt.savefig(plot_path, dpi=150, bbox_inches='tight')
+    plt.close()
+    
+    return plot_path
+
+
+# =================== MAIN TRAINING FUNCTION ===================
+
+def train_fold_enhanced(fold_idx: int, train_paths: List[Tuple[Path, int]], 
+                       val_paths: List[Tuple[Path, int]], config: TrainingConfig,
+                       class_names: List[str], device: torch.device, logger: logging.Logger):
+    """Enhanced fold training optimized for VideoMAE-Small-Kinetics"""
+    
+    logger.info(f"\n{'='*70}")
+    logger.info(f"TRAINING FOLD {fold_idx + 1}/{config.n_folds}")
+    logger.info(f"Train samples: {len(train_paths)} | Validation samples: {len(val_paths)}")
+    logger.info(f"{'='*70}")
+    
+    # Create datasets with intelligent caching (more aggressive for small datasets)
+    train_dataset = ImprovedVideoDataset(
+        train_paths, 
+        cache_strategy="all" if len(train_paths) < 3000 else "selective",
+        cache_threshold=3000,
+        apply_augmentation=True,
+        augmentation_config=config.__dict__,
+        logger=logger
+    )
+    
+    val_dataset = ImprovedVideoDataset(
+        val_paths,
+        cache_strategy="all",
+        apply_augmentation=False,
+        logger=logger
+    )
+    
+    # Create data loaders with optimized settings
+    train_loader = DataLoader(
+        train_dataset,
+        batch_size=config.batch_size,
+        shuffle=True,
+        num_workers=config.num_workers,
+        pin_memory=config.pin_memory,
+        drop_last=True,
+        persistent_workers=config.num_workers > 0
+    )
+    
+    val_loader = DataLoader(
+        val_dataset,
+        batch_size=config.batch_size * 2,  # Larger batch for validation
+        shuffle=False,
+        num_workers=config.num_workers,
+        pin_memory=config.pin_memory,
+        persistent_workers=config.num_workers > 0
+    )
+    
+    # Create model
+    model = EnhancedVideoMAESmallKinetics(config, len(class_names), logger)
+    model = model.to(device)
+    
+    # Create optimizer and scheduler
+    num_training_steps = len(train_loader) * config.epochs
+    if config.use_warmup:
+        optimizer, scheduler, warmup_scheduler = create_optimizer_and_scheduler(
+            model, config, num_training_steps
+        )
+    else:
+        optimizer, scheduler = create_optimizer_and_scheduler(model, config, num_training_steps)
+        warmup_scheduler = None
+    
+    # Initialize tracking
+    history = {
+        'train_loss': [], 'train_acc': [], 
+        'val_loss': [], 'val_acc': [],
+        'learning_rates': []
+    }
+    
+    best_val_acc = 0
+    best_model_state = None
+    early_stopping = EarlyStopping(
+        patience=config.early_stopping_patience,
+        min_delta=config.min_delta,
+        restore_best_weights=True
+    )
+    
+    logger.info(f"Starting training for {config.epochs} epochs...")
+    fold_start_time = time.time()
+    
+    # Training loop
+    for epoch in range(config.epochs):
+        epoch_start_time = time.time()
+        
+        # Training phase
+        train_loss, train_acc = train_epoch_enhanced(
+            model, train_loader, optimizer, scheduler, config, 
+            device, epoch, logger, warmup_scheduler
+        )
+        
+        history['train_loss'].append(train_loss)
+        history['train_acc'].append(train_acc)
+        history['learning_rates'].append(optimizer.param_groups[0]['lr'])
+        
+        # Validation phase
+        if epoch % config.val_frequency == 0 or epoch == config.epochs - 1:
+            val_loss, val_acc, val_preds, val_labels = validate_enhanced(
+                model, val_loader, device, epoch, logger, return_predictions=True
+            )
             
-            print(f"\nEpoch {epoch+1}: "
-                  f"Train Loss: {train_loss_avg:.4f}, Train Acc: {train_acc:.4f}, "
-                  f"Val Loss: {val_loss_avg:.4f}, Val Acc: {val_acc:.4f}, "
-                  f"LR: {current_lr:.6f}")
+            history['val_loss'].append(val_loss)
+            history['val_acc'].append(val_acc)
             
-            # Learning rate scheduling
-            scheduler.step()
-            
-            # Early stopping
+            # Save best model
             if val_acc > best_val_acc:
                 best_val_acc = val_acc
-                patience_counter = 0
-                # Save best model for this fold
-                best_model_state = self.model.state_dict().copy()
-            else:
-                patience_counter += 1
-                if patience_counter >= patience:
-                    print(f"Early stopping triggered at epoch {epoch+1}")
-                    break
-        
-        # Load best model for final evaluation
-        self.model.load_state_dict(best_model_state)
-        
-        # Final validation evaluation
-        self.model.eval()
-        all_predictions = []
-        all_labels = []
-        
-        with torch.no_grad():
-            for batch in val_loader:
-                pixel_values = batch['pixel_values'].to(self.device)
-                labels = batch['labels'].to(self.device)
-                
-                outputs = self.model(pixel_values=pixel_values)
-                predictions = torch.argmax(outputs.logits, dim=-1)
-                
-                all_predictions.extend(predictions.cpu().numpy())
-                all_labels.extend(labels.cpu().numpy())
-
-        fold_model_path = fold_dir / f"model_fold{fold_idx}_best.pth"
-        torch.save(self.model.state_dict(), fold_model_path)
-        
-        return {
-            'history': fold_history,
-            'best_val_acc': best_val_acc,
-            'predictions': all_predictions,
-            'labels': all_labels,
-            'confusion_matrix': confusion_matrix(all_labels, all_predictions)
-        }
-    
-    def train_with_cross_validation(self, n_folds: int = 5):
-        """
-        Main training function with k-fold cross-validation
-        Why k-fold is better for VideoMAE on small datasets:
-        1. Maximizes training data usage
-        2. Provides robust performance estimates
-        3. Reduces overfitting risk
-        4. Identifies problematic samples across folds
-        """
-        # Load data
-        video_paths, labels, self.class_names = self.load_data()
-        
-        # # Verify data pipeline with a test load
-        # print("\nVerifying data pipeline...")
-        # test_dataset = VideoGestureDataset(
-        #     video_paths=[video_paths[0]],
-        #     labels=[labels[0]],
-        #     num_frames=self.num_frames,
-        #     sampling_strategy='uniform',
-        #     processor=self.processor,
-        #     augment=False
-        # )
-        
-        # try:
-        #     test_sample = test_dataset[0]
-        #     print(f"✓ Data pipeline verified")
-        #     print(f"  Sample shape: {test_sample['pixel_values'].shape}")
-        #     print(f"  Expected: (3, {self.num_frames}, 224, 224)")
-        #     print(f"  Data type: {test_sample['pixel_values'].dtype}")
-        #     print(f"  Value range: [{test_sample['pixel_values'].min():.2f}, {test_sample['pixel_values'].max():.2f}]")
+                best_model_state = {
+                    'epoch': epoch,
+                    'model_state_dict': model.state_dict(),
+                    'optimizer_state_dict': optimizer.state_dict(),
+                    'val_accuracy': val_acc,
+                    'val_predictions': val_preds,
+                    'val_labels': val_labels
+                }
+                logger.info(f"New best validation accuracy: {val_acc:.2f}%")
             
-        #     # Skip model test if it fails - we'll catch errors during actual training
-        #     print(f"✓ Proceeding to training...")
-        # except Exception as e:
-        #     print(f"⚠️  Data pipeline warning: {e}")
-        #     print(f"   Continuing with training...")
+            # Early stopping check
+            early_stopping(val_acc, model)
+            if early_stopping.early_stop:
+                logger.info(f"Early stopping triggered at epoch {epoch+1}")
+                logger.info(f"Restoring best model weights (acc: {early_stopping.best_score:.2f}%)")
+                early_stopping.restore_best_model(model)
+                break
         
-        # Create stratified splits
-        splits = self.create_stratified_splits(video_paths, labels, n_folds)
+        epoch_time = time.time() - epoch_start_time
+        logger.info(f"Epoch {epoch+1} completed in {epoch_time:.1f}s")
         
-        # Store results for all folds
-        all_fold_results = []
+        # Memory cleanup
+        if device.type == "mps":
+            torch.mps.synchronize()
+        elif device.type == "cuda":
+            torch.cuda.empty_cache()
         
-        # Train each fold
-        for fold_idx, fold_data in enumerate(splits):
-            # Re-initialize model for each fold (start fresh)
-            print(f"\nInitializing model for fold {fold_idx + 1}...")
-            self.initialize_model()
-            
-            # Train fold
-            fold_results = self.train_fold(fold_data, fold_idx)
-            all_fold_results.append(fold_results)
-            
-            # Update global history
-            for key, values in fold_results['history'].items():
-                self.history[f'fold_{fold_idx}_{key}'] = values
-        
-        # Calculate cross-validation statistics
-        cv_accuracies = [r['best_val_acc'] for r in all_fold_results]
-        
-        print(f"\n{'='*50}")
-        print("Cross-Validation Results")
-        print(f"{'='*50}")
-        print(f"Mean Accuracy: {np.mean(cv_accuracies):.4f} ± {np.std(cv_accuracies):.4f}")
-        print(f"Best Fold: {np.argmax(cv_accuracies) + 1} with {max(cv_accuracies):.4f}")
-        print(f"Worst Fold: {np.argmin(cv_accuracies) + 1} with {min(cv_accuracies):.4f}")
-        
-        # Store results
-        self.cv_results = {
-            'fold_results': all_fold_results,
-            'cv_mean': np.mean(cv_accuracies),
-            'cv_std': np.std(cv_accuracies),
-            'cv_accuracies': cv_accuracies
-        }
-        
-        return self.cv_results
+        gc.collect()
     
-    def plot_training_curves(self):
-        """Plot comprehensive training curves for all folds"""
-        n_folds = len(self.cv_results['fold_results'])
-        
-        fig, axes = plt.subplots(2, 3, figsize=(18, 10))
-        fig.suptitle('VideoMAE Training Analysis - All Folds', fontsize=16, fontweight='bold')
-        
-        # Plot 1: Training Loss
-        ax = axes[0, 0]
-        for fold_idx in range(n_folds):
-            history = self.cv_results['fold_results'][fold_idx]['history']
-            ax.plot(history['train_loss'], label=f'Fold {fold_idx+1}', alpha=0.7)
-        ax.set_xlabel('Epoch')
-        ax.set_ylabel('Loss')
-        ax.set_title('Training Loss Across Folds')
-        ax.legend()
-        ax.grid(True, alpha=0.3)
-        
-        # Plot 2: Validation Loss
-        ax = axes[0, 1]
-        for fold_idx in range(n_folds):
-            history = self.cv_results['fold_results'][fold_idx]['history']
-            ax.plot(history['val_loss'], label=f'Fold {fold_idx+1}', alpha=0.7)
-        ax.set_xlabel('Epoch')
-        ax.set_ylabel('Loss')
-        ax.set_title('Validation Loss Across Folds')
-        ax.legend()
-        ax.grid(True, alpha=0.3)
-        
-        # Plot 3: Training Accuracy
-        ax = axes[0, 2]
-        for fold_idx in range(n_folds):
-            history = self.cv_results['fold_results'][fold_idx]['history']
-            ax.plot(history['train_acc'], label=f'Fold {fold_idx+1}', alpha=0.7)
-        ax.set_xlabel('Epoch')
-        ax.set_ylabel('Accuracy')
-        ax.set_title('Training Accuracy Across Folds')
-        ax.legend()
-        ax.grid(True, alpha=0.3)
-        
-        # Plot 4: Validation Accuracy
-        ax = axes[1, 0]
-        for fold_idx in range(n_folds):
-            history = self.cv_results['fold_results'][fold_idx]['history']
-            ax.plot(history['val_acc'], label=f'Fold {fold_idx+1}', alpha=0.7)
-        ax.set_xlabel('Epoch')
-        ax.set_ylabel('Accuracy')
-        ax.set_title('Validation Accuracy Across Folds')
-        ax.legend()
-        ax.grid(True, alpha=0.3)
-        
-        # Plot 5: Learning Rate Schedule
-        ax = axes[1, 1]
-        for fold_idx in range(n_folds):
-            history = self.cv_results['fold_results'][fold_idx]['history']
-            ax.plot(history['lr'], label=f'Fold {fold_idx+1}', alpha=0.7)
-        ax.set_xlabel('Epoch')
-        ax.set_ylabel('Learning Rate')
-        ax.set_title('Learning Rate Schedule')
-        ax.set_yscale('log')
-        ax.legend()
-        ax.grid(True, alpha=0.3)
-        
-        # Plot 6: Fold Performance Comparison
-        ax = axes[1, 2]
-        fold_accs = self.cv_results['cv_accuracies']
-        bars = ax.bar(range(1, n_folds+1), fold_accs, color='skyblue', edgecolor='navy')
-        ax.axhline(y=np.mean(fold_accs), color='red', linestyle='--', 
-                   label=f'Mean: {np.mean(fold_accs):.4f}')
-        ax.set_xlabel('Fold')
-        ax.set_ylabel('Best Validation Accuracy')
-        ax.set_title('Cross-Validation Performance')
-        ax.set_xticks(range(1, n_folds+1))
-        ax.legend()
-        ax.grid(True, alpha=0.3)
-        
-        # Add value labels on bars
-        for bar, acc in zip(bars, fold_accs):
-            height = bar.get_height()
-            ax.text(bar.get_x() + bar.get_width()/2., height + 0.005,
-                    f'{acc:.3f}', ha='center', va='bottom')
-        
-        plt.tight_layout()
-        plt.savefig(self.out_root / 'videomae_training_curves.png', dpi=300, bbox_inches='tight')
-        plt.close()
+    fold_time = (time.time() - fold_start_time) / 60
+    logger.info(f"Fold {fold_idx+1} completed in {fold_time:.1f} minutes")
     
-    def plot_confusion_matrices(self):
-        """Plot confusion matrices for all folds"""
-        n_folds = len(self.cv_results['fold_results'])
+    # Generate fold plots
+    if config.save_plots_every_fold:
+        plot_path = plot_fold_training_curves(fold_idx, history, config, config.save_dir)
+        logger.info(f"Training curves saved: {plot_path}")
         
-        fig, axes = plt.subplots(2, 3, figsize=(20, 12))
-        fig.suptitle('Confusion Matrices - All Folds', fontsize=16, fontweight='bold')
-        axes = axes.flatten()
-        
-        for fold_idx in range(min(n_folds, 5)):
-            ax = axes[fold_idx]
-            cm = self.cv_results['fold_results'][fold_idx]['confusion_matrix']
-            
-            # Normalize confusion matrix
-            cm_normalized = cm.astype('float') / cm.sum(axis=1)[:, np.newaxis]
-            
-            # Plot
-            sns.heatmap(cm_normalized, annot=True, fmt='.2f', cmap='Blues',
-                       ax=ax, cbar=fold_idx == 0)
-            ax.set_title(f'Fold {fold_idx+1} (Acc: {self.cv_results["cv_accuracies"][fold_idx]:.3f})')
-            ax.set_xlabel('Predicted')
-            ax.set_ylabel('True')
-        
-        # Plot average confusion matrix in the last subplot
-        ax = axes[5]
-        all_cms = [r['confusion_matrix'] for r in self.cv_results['fold_results']]
-        avg_cm = np.mean(all_cms, axis=0)
-        avg_cm_normalized = avg_cm / avg_cm.sum(axis=1)[:, np.newaxis]
-        
-        sns.heatmap(avg_cm_normalized, annot=True, fmt='.2f', cmap='Greens',
-                   ax=ax, cbar=True)
-        ax.set_title(f'Average Across Folds (Mean Acc: {self.cv_results["cv_mean"]:.3f})')
-        ax.set_xlabel('Predicted')
-        ax.set_ylabel('True')
-        
-        plt.tight_layout()
-        plt.savefig(self.out_root / 'videomae_confusion_matrices.png', dpi=300, bbox_inches='tight')
-        plt.close()
+        # Plot confusion matrix for best model
+        if best_model_state and 'val_predictions' in best_model_state:
+            cm_path = plot_confusion_matrix(
+                best_model_state['val_labels'], 
+                best_model_state['val_predictions'],
+                class_names, fold_idx, config.save_dir
+            )
+            logger.info(f"Confusion matrix saved: {cm_path}")
     
-    def plot_per_class_performance(self):
-        """Plot per-class performance analysis"""
-        # Aggregate predictions from all folds
-        all_predictions = []
-        all_labels = []
-        
-        for fold_result in self.cv_results['fold_results']:
-            all_predictions.extend(fold_result['predictions'])
-            all_labels.extend(fold_result['labels'])
-        
-        # Calculate per-class metrics
-        report = classification_report(all_labels, all_predictions, 
-                                      target_names=list(self.class_names.values()),
-                                      output_dict=True)
-        
-        # Extract metrics
-        classes = list(self.class_names.values())
-        precision = [report[c]['precision'] for c in classes]
-        recall = [report[c]['recall'] for c in classes]
-        f1_score = [report[c]['f1-score'] for c in classes]
-        support = [report[c]['support'] for c in classes]
-        
-        # Create plot
-        fig, axes = plt.subplots(2, 2, figsize=(16, 12))
-        fig.suptitle('Per-Class Performance Analysis', fontsize=16, fontweight='bold')
-        
-        # Plot 1: Precision by class
-        ax = axes[0, 0]
-        bars = ax.bar(classes, precision, color='lightcoral')
-        ax.set_xlabel('Gesture Class')
-        ax.set_ylabel('Precision')
-        ax.set_title('Precision by Class')
-        ax.set_ylim([0, 1.1])
-        ax.axhline(y=np.mean(precision), color='red', linestyle='--', alpha=0.5)
-        plt.setp(ax.xaxis.get_majorticklabels(), rotation=45, ha='right')
-        
-        # Add value labels
-        for bar, val in zip(bars, precision):
-            ax.text(bar.get_x() + bar.get_width()/2., bar.get_height() + 0.01,
-                    f'{val:.2f}', ha='center', va='bottom')
-        
-        # Plot 2: Recall by class
-        ax = axes[0, 1]
-        bars = ax.bar(classes, recall, color='lightblue')
-        ax.set_xlabel('Gesture Class')
-        ax.set_ylabel('Recall')
-        ax.set_title('Recall by Class')
-        ax.set_ylim([0, 1.1])
-        ax.axhline(y=np.mean(recall), color='blue', linestyle='--', alpha=0.5)
-        plt.setp(ax.xaxis.get_majorticklabels(), rotation=45, ha='right')
-        
-        for bar, val in zip(bars, recall):
-            ax.text(bar.get_x() + bar.get_width()/2., bar.get_height() + 0.01,
-                    f'{val:.2f}', ha='center', va='bottom')
-        
-        # Plot 3: F1-Score by class
-        ax = axes[1, 0]
-        bars = ax.bar(classes, f1_score, color='lightgreen')
-        ax.set_xlabel('Gesture Class')
-        ax.set_ylabel('F1-Score')
-        ax.set_title('F1-Score by Class')
-        ax.set_ylim([0, 1.1])
-        ax.axhline(y=np.mean(f1_score), color='green', linestyle='--', alpha=0.5)
-        plt.setp(ax.xaxis.get_majorticklabels(), rotation=45, ha='right')
-        
-        for bar, val in zip(bars, f1_score):
-            ax.text(bar.get_x() + bar.get_width()/2., bar.get_height() + 0.01,
-                    f'{val:.2f}', ha='center', va='bottom')
-        
-        # Plot 4: Support distribution
-        ax = axes[1, 1]
-        bars = ax.bar(classes, support, color='lightyellow', edgecolor='orange')
-        ax.set_xlabel('Gesture Class')
-        ax.set_ylabel('Number of Samples')
-        ax.set_title('Sample Distribution by Class')
-        plt.setp(ax.xaxis.get_majorticklabels(), rotation=45, ha='right')
-        
-        for bar, val in zip(bars, support):
-            ax.text(bar.get_x() + bar.get_width()/2., bar.get_height() + 1,
-                    f'{int(val)}', ha='center', va='bottom')
-        
-        plt.tight_layout()
-        plt.savefig(self.out_root / 'videomae_per_class_performance.png', dpi=300, bbox_inches='tight')
-        plt.close()
+    # Log dataset cache statistics
+    train_cache_stats = train_dataset.get_cache_stats()
+    val_cache_stats = val_dataset.get_cache_stats()
+    logger.info(f"Cache Stats - Train: {train_cache_stats['hit_rate']:.1%} hit rate, "
+               f"Val: {val_cache_stats['hit_rate']:.1%} hit rate")
     
-    def plot_error_analysis(self):
-        """Analyze and visualize common errors"""
-        # Aggregate confusion matrices
-        all_cms = [r['confusion_matrix'] for r in self.cv_results['fold_results']]
-        avg_cm = np.mean(all_cms, axis=0)
-        
-        # Find most confused pairs
-        np.fill_diagonal(avg_cm, 0)  # Remove correct predictions
-        confusion_pairs = []
-        
-        for i in range(len(self.class_names)):
-            for j in range(len(self.class_names)):
-                if i != j and avg_cm[i, j] > 0:
-                    confusion_pairs.append({
-                        'true': self.class_names[i],
-                        'predicted': self.class_names[j],
-                        'count': avg_cm[i, j]
-                    })
-        
-        # Sort by confusion count
-        confusion_pairs = sorted(confusion_pairs, key=lambda x: x['count'], reverse=True)[:10]
-        
-        # Create visualization
-        fig, axes = plt.subplots(1, 2, figsize=(16, 6))
-        fig.suptitle('Error Analysis', fontsize=16, fontweight='bold')
-        
-        # Plot 1: Top confusion pairs
-        ax = axes[0]
-        pairs_labels = [f"{cp['true']}→{cp['predicted']}" for cp in confusion_pairs]
-        pairs_counts = [cp['count'] for cp in confusion_pairs]
-        
-        bars = ax.barh(pairs_labels, pairs_counts, color='salmon')
-        ax.set_xlabel('Average Misclassification Count')
-        ax.set_title('Top 10 Most Confused Gesture Pairs')
-        ax.invert_yaxis()
-        
-        for bar, count in zip(bars, pairs_counts):
-            ax.text(bar.get_width() + 0.1, bar.get_y() + bar.get_height()/2,
-                    f'{count:.1f}', ha='left', va='center')
-        
-        # Plot 2: Difficulty score by class
-        ax = axes[1]
-        difficulty_scores = []
-        classes = list(self.class_names.values())
-        
-        for i, class_name in enumerate(classes):
-            # Difficulty = 1 - (correct predictions / total predictions)
-            correct = avg_cm[i, i]
-            total = np.sum(avg_cm[i, :])
-            difficulty = 1 - (correct / total) if total > 0 else 0
-            difficulty_scores.append(difficulty)
-        
-        bars = ax.bar(classes, difficulty_scores, color='orange')
-        ax.set_xlabel('Gesture Class')
-        ax.set_ylabel('Difficulty Score (1 - Accuracy)')
-        ax.set_title('Class Difficulty Analysis')
-        plt.setp(ax.xaxis.get_majorticklabels(), rotation=45, ha='right')
-        
-        for bar, score in zip(bars, difficulty_scores):
-            ax.text(bar.get_x() + bar.get_width()/2., bar.get_height() + 0.01,
-                    f'{score:.2f}', ha='center', va='bottom')
-        
-        plt.tight_layout()
-        plt.savefig(self.out_root / 'videomae_error_analysis.png', dpi=300, bbox_inches='tight')
-        plt.close()
+    # Final validation with best model
+    if early_stopping.best_score:
+        final_val_acc = early_stopping.best_score
+    else:
+        final_val_acc = best_val_acc
     
-    def save_results(self):
-        """Save all training results and model"""
-        
-        # Save cross-validation results
-        with open(self.out_root / 'cv_results.json', 'w') as f:
-            # Convert numpy arrays to lists for JSON serialization
-            results_to_save = {
-                'cv_mean': float(self.cv_results['cv_mean']),
-                'cv_std': float(self.cv_results['cv_std']),
-                'cv_accuracies': [float(x) for x in self.cv_results['cv_accuracies']],
-                'class_names': self.class_names
-            }
-            json.dump(results_to_save, f, indent=2)
-        
-        # Save best model
-        best_idx = int(np.argmax(self.cv_results["cv_accuracies"]))
-        best_path = self.out_root / "best_model.pth"
-        torch.save(
-            {
-                "model_state_dict": self.cv_results["fold_results"][best_idx]["model"].state_dict()
-                if "model" in self.cv_results["fold_results"][best_idx]
-                else self.model.state_dict(),
-                "config": self.model.config,
-                "best_accuracy": float(self.cv_results["cv_accuracies"][best_idx]),
-                "fold": best_idx,
-            },
-            best_path,
-        )
-        print(f"\nBest model (fold {best_idx}) saved to {best_path}")
-        print(f"CV mean ± std: {self.cv_results['cv_mean']:.4f} ± {self.cv_results['cv_std']:.4f}")
+    # Cleanup
+    del model, optimizer, scheduler, train_dataset, val_dataset
+    if warmup_scheduler:
+        del warmup_scheduler
+    if device.type == "mps":
+        torch.mps.empty_cache()
+    elif device.type == "cuda":
+        torch.cuda.empty_cache()
+    gc.collect()
+    
+    return final_val_acc, history, best_model_state
 
 
 def main():
-    """Main training pipeline"""
+    """Main function optimized for VideoMAE-Small-Kinetics with small datasets"""
     
-    # Configuration
-    config = {
-        'data_root': 'preprocessed_videos',     # Output from MediaPipe preprocessing
-        'out_root': "videomae_results",         # Directory to save results
-        'num_classes': 10,                      # 10 gesture classes
-        'num_frames': 16,                       # VideoMAE standard
-        'batch_size': 4,                        # Reduced for Mac/MPS compatibility
-        'learning_rate': 5e-5,                  # Fine-tuning learning rate
-        'num_epochs': 50,                       # Training epochs per fold
-        'device': 'auto',                       # Auto-detect best device
-        'seed': 42,                             # For reproducibility
-        'num_channels': 3,                      # RGB input
+    # Load or create configuration
+    config = TrainingConfig()
+    
+    # Validate configuration
+    config_warnings = config.validate_config()
+    
+    # Setup logging and directories
+    os.makedirs(config.save_dir, exist_ok=True)
+    logger = setup_logging(config.log_level, config.save_dir)
+    
+    # Log configuration warnings
+    for warning in config_warnings:
+        logger.warning(warning)
+    
+    # Save configuration
+    save_config(config, f"{config.save_dir}/config.yaml")
+    
+    logger.info("="*80)
+    logger.info("VIDEOMAE-SMALL-KINETICS TRAINING FOR SMALL DATASETS")
+    logger.info("="*80)
+    logger.info(f"Model: {config.model_name}")
+    logger.info(f"Strategy: {'Feature Extraction' if config.freeze_backbone else 'Fine-tuning'}")
+    logger.info(f"Dataset size optimizations: {'Enabled' if config.freeze_backbone else 'Disabled'}")
+    
+    # Setup device
+    if torch.backends.mps.is_available():
+        device = torch.device("mps")
+        optimize_for_device("mps")
+        logger.info("Using MPS (Apple Silicon) with optimizations")
+    elif torch.cuda.is_available():
+        device = torch.device("cuda")
+        optimize_for_device("cuda")
+        logger.info(f"Using CUDA: {torch.cuda.get_device_name()}")
+    else:
+        device = torch.device("cpu")
+        logger.warning("Using CPU - training will be slow")
+    
+    # Set random seeds for reproducibility
+    torch.manual_seed(config.seed)
+    np.random.seed(config.seed)
+    random.seed(config.seed)
+    
+    if device.type == "cuda":
+        torch.cuda.manual_seed(config.seed)
+        torch.cuda.manual_seed_all(config.seed)
+    
+    # Load dataset
+    data_dir = Path(config.data_dir)
+    if not data_dir.exists():
+        raise FileNotFoundError(f"Data directory not found: {config.data_dir}")
+    
+    data_paths = []
+    class_names = []
+    
+    logger.info("Loading dataset...")
+    for class_dir in sorted(data_dir.iterdir()):
+        if class_dir.is_dir():
+            class_idx = len(class_names)
+            class_names.append(class_dir.name)
+            
+            pt_files = list(class_dir.glob("*.pt"))
+            if not pt_files:
+                logger.warning(f"No .pt files found in {class_dir}")
+                continue
+                
+            for pt_file in pt_files:
+                data_paths.append((pt_file, class_idx))
+            
+            logger.info(f"  Class {class_idx}: {class_dir.name} - {len(pt_files)} samples")
+    
+    if not data_paths:
+        raise ValueError(f"No .pt files found in {config.data_dir}")
+    
+    # Update config with actual number of classes
+    config.num_labels = len(class_names)
+    
+    logger.info(f"\nDataset Summary:")
+    logger.info(f"  Total classes: {len(class_names)}")
+    logger.info(f"  Total samples: {len(data_paths)}")
+    logger.info(f"  Average samples per class: {len(data_paths)/len(class_names):.1f}")
+    
+    # Check if dataset is suitable for current configuration
+    avg_samples_per_class = len(data_paths) / len(class_names)
+    if avg_samples_per_class < 50:
+        logger.error("Dataset too small! Need at least 50 samples per class")
+        return
+    elif avg_samples_per_class < 100:
+        logger.warning("Very small dataset - ensure frozen backbone is used")
+        config.freeze_backbone = True
+        config.use_feature_extractor_mode = True
+    
+    # Test data loading
+    logger.info("Testing data loading speed...")
+    test_start = time.time()
+    try:
+        test_tensor = torch.load(data_paths[0][0], map_location='cpu')
+        load_time = (time.time() - test_start) * 1000
+        logger.info(f"  Single tensor load time: {load_time:.1f}ms")
+        logger.info(f"  Tensor shape: {test_tensor.shape}")
+        logger.info(f"  Estimated epoch time: {len(data_paths) * load_time / 60000:.1f} minutes")
+        
+        # Verify tensor format matches VideoMAE expectations
+        expected_shape = (3, 16, 224, 224)  # (C, T, H, W)
+        if test_tensor.shape != expected_shape:
+            logger.warning(f"Tensor shape {test_tensor.shape} doesn't match expected {expected_shape}")
+            logger.warning("This may cause issues with VideoMAE-Small model")
+            
+    except Exception as e:
+        logger.error(f"Failed to load test tensor: {e}")
+        raise
+    
+    # Setup K-fold cross-validation
+    labels = [label for _, label in data_paths]
+    skf = StratifiedKFold(n_splits=config.n_folds, shuffle=True, random_state=config.seed)
+    
+    logger.info(f"\nStarting {config.n_folds}-fold cross-validation...")
+    
+    # Training tracking
+    fold_accuracies = []
+    all_histories = []
+    all_best_models = []
+    
+    total_start_time = time.time()
+    
+    # Train each fold
+    for fold_idx, (train_idx, val_idx) in enumerate(skf.split(range(len(data_paths)), labels)):
+        train_paths = [data_paths[i] for i in train_idx]
+        val_paths = [data_paths[i] for i in val_idx]
+        
+        # Verify fold balance
+        train_labels = [labels[i] for i in train_idx]
+        val_labels = [labels[i] for i in val_idx]
+        
+        train_class_counts = np.bincount(train_labels)
+        val_class_counts = np.bincount(val_labels)
+        
+        logger.info(f"\nFold {fold_idx+1} class distribution:")
+        logger.info(f"  Train: min={train_class_counts.min()}, max={train_class_counts.max()}")
+        logger.info(f"  Val: min={val_class_counts.min()}, max={val_class_counts.max()}")
+        
+        # Check if fold has sufficient samples
+        if train_class_counts.min() < 3:
+            logger.warning(f"Fold {fold_idx+1} has classes with < 3 training samples")
+        if val_class_counts.min() < 1:
+            logger.warning(f"Fold {fold_idx+1} has classes with no validation samples")
+        
+        # Train fold
+        try:
+            fold_acc, history, best_model = train_fold_enhanced(
+                fold_idx, train_paths, val_paths, config, class_names, device, logger
+            )
+            
+            fold_accuracies.append(fold_acc)
+            all_histories.append(history)
+            all_best_models.append(best_model)
+            
+            logger.info(f"Fold {fold_idx+1} completed - Best accuracy: {fold_acc:.2f}%")
+            
+        except Exception as e:
+            logger.error(f"Fold {fold_idx+1} failed: {e}")
+            logger.error(f"Error type: {type(e).__name__}")
+            import traceback
+            logger.error(f"Traceback: {traceback.format_exc()}")
+            raise
+        
+        # Inter-fold cleanup
+        gc.collect()
+        if device.type == "mps":
+            torch.mps.empty_cache()
+        elif device.type == "cuda":
+            torch.cuda.empty_cache()
+    
+    # Calculate final results
+    total_time = (time.time() - total_start_time) / 60
+    mean_acc = np.mean(fold_accuracies)
+    std_acc = np.std(fold_accuracies)
+    
+    logger.info("\n" + "="*80)
+    logger.info("FINAL RESULTS - VIDEOMAE-SMALL-KINETICS")
+    logger.info("="*80)
+    
+    for i, acc in enumerate(fold_accuracies):
+        logger.info(f"Fold {i+1}: {acc:.2f}%")
+    
+    logger.info(f"\nCross-Validation Results:")
+    logger.info(f"  Mean Accuracy: {mean_acc:.2f}% ± {std_acc:.2f}%")
+    logger.info(f"  Best Fold: {np.argmax(fold_accuracies)+1} ({np.max(fold_accuracies):.2f}%)")
+    logger.info(f"  Worst Fold: {np.argmin(fold_accuracies)+1} ({np.min(fold_accuracies):.2f}%)")
+    logger.info(f"  Range: {np.max(fold_accuracies) - np.min(fold_accuracies):.2f}%")
+    
+    # Performance analysis
+    if std_acc > 5:
+        logger.warning(f"High variance detected ({std_acc:.2f}%) - consider more regularization")
+    elif std_acc < 2:
+        logger.info(f"Low variance ({std_acc:.2f}%) - consistent performance across folds")
+    
+    logger.info(f"\nTraining Time:")
+    logger.info(f"  Total time: {total_time:.1f} minutes")
+    logger.info(f"  Average time per fold: {total_time/config.n_folds:.1f} minutes")
+    
+    # Compare with expected performance for small datasets
+    if mean_acc > 80:
+        logger.info("Excellent performance for small dataset!")
+    elif mean_acc > 70:
+        logger.info("Good performance for small dataset")
+    elif mean_acc > 60:
+        logger.info("Reasonable performance - consider hyperparameter tuning")
+    else:
+        logger.warning("Low performance - check data quality or increase regularization")
+    
+    # Generate comprehensive summary plots
+    summary_plot_path = plot_all_folds_summary(
+        all_histories, fold_accuracies, config, total_time, config.save_dir
+    )
+    logger.info(f"Comprehensive summary plot saved: {summary_plot_path}")
+    
+    # Save detailed results
+    results = {
+        'model_info': {
+            'model_name': config.model_name,
+            'architecture': 'VideoMAE-Small-Kinetics',
+            'hidden_size': 384,
+            'strategy': 'Feature Extraction' if config.freeze_backbone else 'Fine-tuning',
+            'total_parameters': '~22M',
+            'trainable_parameters': '~28K' if config.freeze_backbone else '~22M'
+        },
+        'dataset_info': {
+            'num_classes': len(class_names),
+            'num_samples': len(data_paths),
+            'avg_samples_per_class': len(data_paths) / len(class_names),
+            'class_names': class_names,
+            'dataset_balance': 'good' if (max([labels.count(i) for i in range(len(class_names))]) / 
+                                        min([labels.count(i) for i in range(len(class_names))])) < 2 else 'imbalanced'
+        },
+        'cross_validation_results': {
+            'fold_accuracies': fold_accuracies,
+            'mean_accuracy': float(mean_acc),
+            'std_accuracy': float(std_acc),
+            'min_accuracy': float(np.min(fold_accuracies)),
+            'max_accuracy': float(np.max(fold_accuracies)),
+            'best_fold': int(np.argmax(fold_accuracies)) + 1,
+            'worst_fold': int(np.argmin(fold_accuracies)) + 1,
+            'performance_consistency': 'high' if std_acc < 3 else 'medium' if std_acc < 6 else 'low'
+        },
+        'training_info': {
+            'total_time_minutes': total_time,
+            'time_per_fold_minutes': total_time / config.n_folds,
+            'total_epochs': sum(len(h['train_acc']) for h in all_histories),
+            'avg_epochs_per_fold': sum(len(h['train_acc']) for h in all_histories) / config.n_folds,
+            'device_used': str(device),
+            'early_stopping_triggered': any(len(h['train_acc']) < config.epochs for h in all_histories),
+            'config': config.__dict__
+        },
+        'optimization_info': {
+            'augmentation_used': config.mixup_alpha > 0 or config.cutmix_alpha > 0,
+            'label_smoothing': config.label_smoothing,
+            'regularization_dropout': config.dropout_rate,
+            'learning_rate_strategy': 'cosine_annealing' if config.use_cosine_annealing else 'step',
+            'warmup_used': config.use_warmup,
+            'mixed_precision': config.mixed_precision
+        }
     }
     
-    print("="*60)
-    print("VideoMAE Training Pipeline for Nepali Sign Language")
-    print("="*60)
-    print("\nConfiguration:")
-    for key, value in config.items():
-        print(f"  {key}: {value}")
-    print()
+    # Save results to JSON
+    results_path = f"{config.save_dir}/detailed_results.json"
+    with open(results_path, 'w') as f:
+        json.dump(results, f, indent=2)
     
+    logger.info(f"Detailed results saved: {results_path}")
     
-    # Initialize trainer
-    trainer = VideoMAETrainer(**config)
+    # Create performance comparison with expected baselines
+    logger.info("\n" + "="*60)
+    logger.info("PERFORMANCE ANALYSIS")
+    logger.info("="*60)
     
-    # Device-specific recommendations
-    if trainer.device.type == 'mps':
-        print("\n⚠️  Running on Apple Silicon (MPS)")
-        print("   - Using batch_size=4 for memory efficiency")
-        print("   - Using num_workers=0 to avoid multiprocessing issues")
-        print("   - Mixed precision training disabled (not supported on MPS)")
-    elif trainer.device.type == 'cpu':
-        print("\n⚠️  Running on CPU - Training will be slow")
-        print("   - Consider using a smaller batch_size (2-4) and fewer epochs")
-        print("   - Using num_workers=0 for stability")
+    # Expected performance baselines for different scenarios
+    if config.freeze_backbone:
+        if avg_samples_per_class < 100:
+            expected_range = (60, 80)
+            baseline_desc = "frozen backbone, very small dataset"
+        else:
+            expected_range = (70, 85)
+            baseline_desc = "frozen backbone, small dataset"
+    else:
+        expected_range = (50, 70)
+        baseline_desc = "full fine-tuning, high overfitting risk"
     
-    # Train with 5-fold cross-validation
-    print("\nStarting 5-fold cross-validation training...")
-    cv_results = trainer.train_with_cross_validation(n_folds=5)
+    logger.info(f"Expected performance range for {baseline_desc}: {expected_range[0]}-{expected_range[1]}%")
+    logger.info(f"Achieved performance: {mean_acc:.2f}%")
     
-    # Generate comprehensive plots
-    print("\nGenerating training visualizations...")
-    trainer.plot_training_curves()
-    trainer.plot_confusion_matrices()
-    trainer.plot_per_class_performance()
-    trainer.plot_error_analysis()
+    if mean_acc >= expected_range[1]:
+        logger.info("EXCELLENT: Performance exceeds expectations!")
+    elif mean_acc >= expected_range[0]:
+        logger.info("GOOD: Performance within expected range")
+    else:
+        logger.warning("BELOW EXPECTED: Consider hyperparameter tuning or data quality check")
     
-    # Save results
-    trainer.save_results()
+    # Create simple summary plot
+    plt.figure(figsize=(15, 5))
     
-    print("\n" + "="*60)
-    print("Training Complete!")
-    print("="*60)
-    print(f"Final CV Accuracy: {cv_results['cv_mean']:.4f} ± {cv_results['cv_std']:.4f}")
-    print("\nAll visualizations saved to current directory")
-    print("Model and results saved to 'videomae_results' directory")
+    # Plot 1: Fold comparison
+    plt.subplot(1, 3, 1)
+    bars = plt.bar(range(1, len(fold_accuracies)+1), fold_accuracies, 
+                   color='lightcoral', edgecolor='darkred', alpha=0.8)
+    plt.axhline(y=mean_acc, color='navy', linestyle='--', linewidth=2,
+                label=f'Mean: {mean_acc:.1f}%')
+    
+    for i, (bar, val) in enumerate(zip(bars, fold_accuracies)):
+        height = bar.get_height()
+        plt.text(bar.get_x() + bar.get_width()/2., height + 0.5,
+                f'{val:.1f}%', ha='center', va='bottom', fontweight='bold', fontsize=10)
+    
+    plt.xlabel('Fold')
+    plt.ylabel('Best Validation Accuracy (%)')
+    plt.title('VideoMAE-Small-Kinetics\nK-Fold Cross-Validation Results')
+    plt.legend()
+    plt.grid(True, alpha=0.3, axis='y')
+    plt.ylim(0, 100)
+    
+    # Plot 2: Learning curves (average)
+    plt.subplot(1, 3, 2)
+    
+    # Calculate average learning curves
+    max_epochs = max(len(h['val_acc']) for h in all_histories if h['val_acc'])
+    avg_val_acc = []
+    
+    for epoch in range(max_epochs):
+        epoch_accs = []
+        for hist in all_histories:
+            if hist['val_acc'] and epoch < len(hist['val_acc']):
+                epoch_accs.append(hist['val_acc'][epoch])
+        if epoch_accs:
+            avg_val_acc.append(np.mean(epoch_accs))
+    
+    if avg_val_acc:
+        epochs_range = range(1, len(avg_val_acc) + 1)
+        plt.plot(epochs_range, avg_val_acc, 'o-', color='darkblue', 
+                linewidth=2, markersize=4, alpha=0.8)
+        plt.axhline(y=mean_acc, color='red', linestyle='--', alpha=0.7,
+                   label=f'Final Mean: {mean_acc:.1f}%')
+        
+        plt.xlabel('Epoch')
+        plt.ylabel('Validation Accuracy (%)')
+        plt.title('Average Learning Curve\n(Across All Folds)')
+        plt.legend()
+        plt.grid(True, alpha=0.3)
+        plt.ylim(0, 100)
+    
+    # Plot 3: Model comparison info
+    plt.subplot(1, 3, 3)
+    plt.axis('off')
+    
+    comparison_text = f"""
+    MODEL COMPARISON
+    
+    VideoMAE-Small-Kinetics:
+    • Architecture: 384 hidden dim
+    • Parameters: ~22M total
+    • Trainable: {'~28K' if config.freeze_backbone else '~22M'}
+    • Strategy: {'Frozen' if config.freeze_backbone else 'Fine-tuned'}
+    
+    DATASET CHARACTERISTICS:
+    • Classes: {len(class_names)}
+    • Total samples: {len(data_paths)}
+    • Avg per class: {avg_samples_per_class:.0f}
+    • Size category: {'Very Small' if avg_samples_per_class < 100 else 'Small'}
+    
+    RESULTS:
+    • Mean CV Accuracy: {mean_acc:.1f}%
+    • Standard Deviation: {std_acc:.1f}%
+    • Best Fold: {np.max(fold_accuracies):.1f}%
+    • Performance: {'Excellent' if mean_acc > 80 else 'Good' if mean_acc > 70 else 'Fair'}
+    
+    RECOMMENDATION:
+    {'✓ Current setup optimal' if mean_acc > 75 and std_acc < 5 else 
+     '→ Consider more regularization' if std_acc > 5 else
+     '→ Try different augmentation' if mean_acc < 70 else
+     '→ Setup looks good'}
+    """
+    
+    plt.text(0.05, 0.95, comparison_text, transform=plt.gca().transAxes, fontsize=9,
+            verticalalignment='top', fontfamily='monospace',
+            bbox=dict(boxstyle='round,pad=0.5', facecolor='lightgreen', alpha=0.8))
+    
+    plt.tight_layout()
+    simple_plot_path = f"{config.save_dir}/videomae_small_summary_results.png"
+    plt.savefig(simple_plot_path, dpi=150, bbox_inches='tight')
+    plt.close()
+    
+    logger.info(f"Summary plot saved: {simple_plot_path}")
+    
+    # Generate recommendations for improvement
+    logger.info("\n" + "="*60)
+    logger.info("RECOMMENDATIONS FOR OPTIMIZATION")
+    logger.info("="*60)
+    
+    if std_acc > 5:
+        logger.info("• High variance detected:")
+        logger.info("  - Increase regularization (dropout, weight decay)")
+        logger.info("  - Use more aggressive data augmentation")
+        logger.info("  - Consider ensemble methods")
+    
+    if mean_acc < 70:
+        logger.info("• Performance improvement suggestions:")
+        logger.info("  - Try different augmentation strategies")
+        logger.info("  - Experiment with learning rates")
+        logger.info("  - Consider progressive unfreezing")
+        logger.info("  - Check data quality and labeling")
+    
+    if not config.freeze_backbone and avg_samples_per_class < 200:
+        logger.info("• For small datasets:")
+        logger.info("  - STRONGLY RECOMMEND: Use frozen backbone")
+        logger.info("  - Current full fine-tuning likely causing overfitting")
+    
+    if config.freeze_backbone and mean_acc > 85:
+        logger.info("• Excellent performance achieved:")
+        logger.info("  - Current configuration is optimal")
+        logger.info("  - Consider testing on additional validation data")
+    
+    # Save training script configuration for reproduction
+    final_config_path = f"{config.save_dir}/final_optimal_config.yaml"
+    save_config(config, final_config_path)
+    
+    logger.info(f"\nTraining completed successfully!")
+    logger.info(f"All results saved to: {config.save_dir}/")
+    logger.info(f"Optimal configuration saved to: {final_config_path}")
+    
+    # Create a simple readme file with results
+    readme_content = f"""# VideoMAE-Small-Kinetics Training Results
+
+## Model Configuration
+- **Model**: {config.model_name}
+- **Architecture**: VideoMAE-Small (384 hidden dimensions)
+- **Training Strategy**: {'Feature Extraction (Frozen Backbone)' if config.freeze_backbone else 'Full Fine-tuning'}
+- **Trainable Parameters**: {'~28K' if config.freeze_backbone else '~22M'}
+
+## Dataset Information
+- **Classes**: {len(class_names)}
+- **Total Samples**: {len(data_paths)}
+- **Average Samples per Class**: {avg_samples_per_class:.0f}
+- **Dataset Size Category**: {'Very Small' if avg_samples_per_class < 100 else 'Small'}
+
+## Cross-Validation Results
+- **Mean Accuracy**: {mean_acc:.2f}% ± {std_acc:.2f}%
+- **Best Fold**: Fold {np.argmax(fold_accuracies)+1} ({np.max(fold_accuracies):.2f}%)
+- **Performance Range**: {np.min(fold_accuracies):.2f}% - {np.max(fold_accuracies):.2f}%
+- **Total Training Time**: {total_time:.1f} minutes
+
+## Training Configuration
+- **Epochs**: {config.epochs}
+- **Batch Size**: {config.batch_size}
+- **Learning Rate**: {config.learning_rate}
+- **Regularization**: Dropout {config.dropout_rate}, Weight Decay {config.weight_decay}
+- **Augmentation**: {'Yes' if config.mixup_alpha > 0 or config.cutmix_alpha > 0 else 'No'}
+
+## Files Generated
+- `detailed_results.json`: Complete training metrics
+- `config.yaml`: Training configuration used
+- `final_optimal_config.yaml`: Optimized configuration for reproduction
+- `fold_*_training_curves.png`: Individual fold training curves
+- `fold_*_confusion_matrix.png`: Confusion matrices per fold
+- `all_folds_comprehensive_summary.png`: Complete analysis
+- `videomae_small_summary_results.png`: Quick summary
+- `training.log`: Detailed training logs
+
+## Performance Assessment
+**Result**: {'Excellent' if mean_acc > 80 else 'Good' if mean_acc > 70 else 'Fair' if mean_acc > 60 else 'Needs Improvement'}
+
+**Recommendation**: {'Current setup is optimal for your dataset size and composition.' if mean_acc > 75 and std_acc < 5 else 
+'Consider increasing regularization to reduce variance.' if std_acc > 5 else
+'Try hyperparameter tuning to improve performance.' if mean_acc < 70 else
+'Setup performs well for the given constraints.'}
+"""
+    
+    readme_path = f"{config.save_dir}/README.md"
+    with open(readme_path, 'w') as f:
+        f.write(readme_content)
+    
+    logger.info(f"Results summary saved to: {readme_path}")
+    
+    return results
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        results = main()
+        print("\n" + "="*50)
+        print("TRAINING COMPLETED SUCCESSFULLY!")
+        print("="*50)
+        print(f"Mean CV Accuracy: {results['cross_validation_results']['mean_accuracy']:.2f}%")
+        print(f"Results saved to: {results['training_info']['config']['save_dir']}")
+        print("="*50)
+        
+    except KeyboardInterrupt:
+        print("\nTraining interrupted by user")
+    except Exception as e:
+        print(f"\nTraining failed: {e}")
+        import traceback
+        print(f"Full traceback:\n{traceback.format_exc()}")
+        raise
