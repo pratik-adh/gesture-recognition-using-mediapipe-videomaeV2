@@ -3,18 +3,18 @@ import shutil
 import re
 
 # Define the gesture mapping (list of gesture names for reference)
-GESTURE_MAP = {
-    1: "KA", 2: "KHA", 3: "GA", 4: "GHA", 5: "NGA", 6: "CHA", 7: "CHHA", 8: "JA", 9: "JHA", 10: "YAN"
-}
-
-# # Define the gesture mapping (list of gesture names for reference)
 # GESTURE_MAP = {
-#     1: "KA", 2: "KHA", 3: "GA", 4: "GHA", 5: "NGA", 6: "CHA", 7: "CHHA", 8: "JA",
-#     9: "JHA", 10: "YAN", 11: "TA", 12: "THA", 13: "DA", 14: "DHA", 15: "NA",
-#     16: "TAA", 17: "THAA", 18: "DAA", 19: "DHAA", 20: "NAA", 21: "PA", 22: "PHA",
-#     23: "BA", 24: "BHA", 25: "MA", 26: "YA", 27: "RA", 28: "LA", 29: "WA",
-#     30: "T_SHA", 31: "M_SHA", 32: "D_SHA", 33: "HA", 34: "KSHA", 35: "TRA", 36: "GYA"
+#     1: "KA", 2: "KHA", 3: "GA", 4: "GHA", 5: "NGA", 6: "CHA", 7: "CHHA", 8: "JA", 9: "JHA", 10: "YAN"
 # }
+
+# Define the gesture mapping (list of gesture names for reference)
+GESTURE_MAP = {
+    1: "KA", 2: "KHA", 3: "GA", 4: "GHA", 5: "NGA", 6: "CHA", 7: "CHHA", 8: "JA",
+    9: "JHA", 10: "YAN", 11: "TA", 12: "THA", 13: "DA", 14: "DHA", 15: "NA",
+    16: "TAA", 17: "THAA", 18: "DAA", 19: "DHAA", 20: "NAA", 21: "PA", 22: "PHA",
+    23: "BA", 24: "BHA", 25: "MA", 26: "YA", 27: "RA", 28: "LA", 29: "WA",
+    30: "T_SHA", 31: "M_SHA", 32: "D_SHA", 33: "HA", 34: "KSHA", 35: "TRA", 36: "GYA"
+}
 
 BASE_DIR = os.path.expanduser("~/Downloads/10478554/NSL_Consonant_Part_1")
 
