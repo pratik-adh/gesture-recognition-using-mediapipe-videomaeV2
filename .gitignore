@@ -1,6 +1,10 @@
 
 *dataset*/
+*processed*/
 *videos*/
+*pytorch_compressed_tensors/
+*pytorch_tensors/
+*kaggle/
 
 *model*
 
@@ -8,5 +12,7 @@
 *.jpeg
 *.png
 *.env
+*.mp4
+*.log
 
 /train-test-val-split
