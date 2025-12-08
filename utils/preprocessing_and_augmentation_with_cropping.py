@@ -1206,7 +1206,7 @@ def main():
     OUTPUT_DATASET_PATH = "preprocessed_and_augmented_videos_new"  # Output folder for processed videos
     
     # Augmentation settings
-    AUGMENTATIONS_PER_VIDEO = 2     # Number of augmented versions per original video
+    AUGMENTATIONS_PER_VIDEO = 20     # Number of augmented versions per original video
     AUGMENTATION_PROBABILITY = 0.85   # Probability of applying each augmentation
     
     # Hand cropping settings

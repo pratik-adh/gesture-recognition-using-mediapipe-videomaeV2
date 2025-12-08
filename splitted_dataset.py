@@ -7,8 +7,8 @@ import random
 from tqdm import tqdm
 
 # Configuration - Change these if needed
-SOURCE_DIR = 'npz_preprocessed_videos'
-OUTPUT_DIR = 'npz_preprocessed_videos_splitted_dataset'
+SOURCE_DIR = 'npz_lightweight_videos_without_cropping'
+OUTPUT_DIR = 'npz_lightweight_videos_without_cropping_splitted_dataset'
 TRAIN_RATIO = 0.70
 # TRAIN_RATIO = 0.80
 VAL_RATIO = 0.15
