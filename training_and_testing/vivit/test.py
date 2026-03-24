@@ -589,7 +589,7 @@ class ModelTester:
             logger.info("Using CPU")
         
         # Create results directory
-        self.results_dir = Path('./../../output/vivit')
+        self.results_dir = Path('./../../output/vivit/new')
         self.results_dir.mkdir(parents=True, exist_ok=True)
         
         self.plot_dir = self.results_dir / 'plots'
@@ -901,7 +901,7 @@ def main():
     """
     
     # ===== CONFIGURE THESE PATHS =====
-    model_path = './../../kaggle/training_output_vivit/best_model.pth'
+    model_path = './../../kaggle/training_output_vivit/new_output/best_model.pth'
     test_dir = './../../videos_directory/npz_lightweight_videos_without_cropping_splitted_dataset/test'
     # ==================================
     

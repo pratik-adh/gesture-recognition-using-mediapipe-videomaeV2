@@ -17,6 +17,10 @@ import psutil
 import threading
 from queue import Queue
 
+from pathlib import Path
+
+BASE_DIR = Path(__file__).resolve().parent 
+
 # Set up logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
@@ -251,28 +255,28 @@ class NSLVideoAugmenterWithCrop:
         # Define augmentation functions with conservative parameters
         self.augmentations = {
             'bright_high':        self._brightness_high,
-            'bright_low':         self._brightness_low,
-            'contrast_high':      self._contrast_high,
-            'contrast_low':       self._contrast_low,
-            'saturation_high':    self._saturation_high,
-            'saturation_low':     self._saturation_low,
-            'blur_motion':        self._motion_blur,
-            'blur_gaussian':      self._gaussian_blur,
+            # 'bright_low':         self._brightness_low,
+            # 'contrast_high':      self._contrast_high,
+            # 'contrast_low':       self._contrast_low,
+            # 'saturation_high':    self._saturation_high,
+            # 'saturation_low':     self._saturation_low,
+            # 'blur_motion':        self._motion_blur,
+            # 'blur_gaussian':      self._gaussian_blur,
             'noise_moderate':     self._moderate_noise,
             'noise_salt_pepper':  self._salt_pepper_noise,
-            'gamma_high':         self._gamma_high,
-            'gamma_low':          self._gamma_low,
-            'hue_shift':          self._hue_shift,
-            'bilateral_filter':   self._bilateral_filter,
-            'clahe':              self._clahe,
-            'color_temp_warm':    self._color_temperature_warm,
-            'color_temp_cool':    self._color_temperature_cool,
-            'film_grain':         self._film_grain,
-            'compression_artifacts': self._compression_artifacts,
-            'shadow_highlight':   self._shadow_highlight,
-            'exposure_comp':      self._exposure_compensation,
-            'color_jitter':       self._color_jitter,
-            'defocus_blur':       self._defocus_blur
+            # 'gamma_high':         self._gamma_high,
+            # 'gamma_low':          self._gamma_low,
+            # 'hue_shift':          self._hue_shift,
+            # 'bilateral_filter':   self._bilateral_filter,
+            # 'clahe':              self._clahe,
+            # 'color_temp_warm':    self._color_temperature_warm,
+            # 'color_temp_cool':    self._color_temperature_cool,
+            # 'film_grain':         self._film_grain,
+            # 'compression_artifacts': self._compression_artifacts,
+            # 'shadow_highlight':   self._shadow_highlight,
+            # 'exposure_comp':      self._exposure_compensation,
+            # 'color_jitter':       self._color_jitter,
+            # 'defocus_blur':       self._defocus_blur
         }
         
         # Supported video formats (input and output)
@@ -526,7 +530,7 @@ class NSLVideoAugmenterWithCrop:
         return np.clip(frame.astype(np.int16) + noise, 0, 255).astype(np.uint8)
     
     def _salt_pepper_noise(self, frame: np.ndarray) -> np.ndarray:
-        density = random.uniform(0.001, 0.003)
+        density = random.uniform(0.01, 0.05)  # 1% – 5%
         out = frame.copy()
         mask = np.random.random(out.shape[:2]) < density
         salt = np.random.random(mask.sum()) < 0.5
@@ -1202,11 +1206,11 @@ def main():
     # ======================== CONFIGURATION ========================
     
     # Paths
-    INPUT_DATASET_PATH = "main_dataset"        # Input folder containing class folders
-    OUTPUT_DATASET_PATH = "preprocessed_and_augmented_videos_new"  # Output folder for processed videos
+    INPUT_DATASET_PATH = "main_dataset/BHA"        # Input folder containing class folders
+    OUTPUT_DATASET_PATH = "preprocessed_and_augmented_videos_new1"  # Output folder for processed videos
     
     # Augmentation settings
-    AUGMENTATIONS_PER_VIDEO = 20     # Number of augmented versions per original video
+    AUGMENTATIONS_PER_VIDEO = 4     # Number of augmented versions per original video
     AUGMENTATION_PROBABILITY = 0.85   # Probability of applying each augmentation
     
     # Hand cropping settings

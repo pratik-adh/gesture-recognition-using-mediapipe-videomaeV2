@@ -1,1120 +1,582 @@
 #!/usr/bin/env python3
 """
-ViViT Configured to Reach 85-90% Validation Accuracy at Epoch 50
-WITH COMPREHENSIVE PLOTTING
+Video Vision Transformer (ViViT) with Optuna Bayesian Optimization
+Hyperparameter tuning for Nepali Sign Language Recognition
 """
 
-import os
-import cv2
-import numpy as np
-import torch
-import torch.nn as nn
-import torch.optim as optim
+import os, numpy as np, torch, torch.nn as nn, torch.optim as optim, random, json, logging, warnings
 from torch.utils.data import Dataset, DataLoader
-from torch.cuda.amp import autocast, GradScaler
-import matplotlib.pyplot as plt
-import seaborn as sns
+from sklearn.metrics import confusion_matrix, classification_report, f1_score, accuracy_score
+import matplotlib.pyplot as plt, seaborn as sns
 from tqdm import tqdm
-import warnings
-import random
-import pandas as pd
 from pathlib import Path
-import logging
-from datetime import datetime
-from torch.utils.tensorboard import SummaryWriter
-import math
+from torchvision import transforms
+from PIL import Image
+from collections import Counter
+import optuna
+from optuna.trial import TrialState
 
 warnings.filterwarnings('ignore')
-
-# Set seaborn style for better plots
-sns.set_style("whitegrid")
-plt.rcParams['figure.figsize'] = (12, 8)
-plt.rcParams['font.size'] = 10
-
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(levelname)s - %(message)s',
-    handlers=[logging.StreamHandler(), logging.FileHandler('training_85_90.log', mode='a')]
-)
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(message)s')
 logger = logging.getLogger(__name__)
 
 def set_seed(seed=42):
-    random.seed(seed)
-    np.random.seed(seed)
-    torch.manual_seed(seed)
-    if torch.cuda.is_available():
-        torch.cuda.manual_seed_all(seed)
-    torch.backends.cudnn.deterministic = False
-    torch.backends.cudnn.benchmark = True
+    random.seed(seed); np.random.seed(seed); torch.manual_seed(seed)
+    if torch.cuda.is_available(): torch.cuda.manual_seed_all(seed)
+    torch.backends.cudnn.deterministic = True; torch.backends.cudnn.benchmark = False
 
 set_seed(42)
 
-# -------------------------
-# Dataset with HEAVY Augmentation
-# -------------------------
-class NPZDirectoryDataset(Dataset):
-    def __init__(self, root_dir, num_frames=8, is_training=True, img_size=96):
-        self.root_dir = Path(root_dir)
-        self.num_frames = num_frames
-        self.is_training = is_training
-        self.img_size = img_size
-
-        self.samples = []
-        self.class_to_idx = {}
-        self.classes = []
+# ===== DATASET =====
+class NPZDataset(Dataset):
+    def __init__(self, root_dir, num_frames=16, img_size=112, is_training=True):
+        self.root_dir, self.num_frames, self.img_size, self.is_training = Path(root_dir), num_frames, img_size, is_training
+        self.samples, self.classes = [], []
         self._scan_directory()
-
-        logger.info(f"Dataset: {root_dir}")
-        logger.info(f"Classes: {len(self.classes)}, Samples: {len(self.samples)}")
-
-    def _scan_directory(self):
-        if not self.root_dir.exists():
-            raise FileNotFoundError(f"{self.root_dir} does not exist")
         
-        class_dirs = sorted([d for d in self.root_dir.iterdir() if d.is_dir()])
-        for cid, d in enumerate(class_dirs):
+        if is_training:
+            self.transform = transforms.Compose([
+                transforms.Resize((img_size, img_size)),
+                transforms.RandomHorizontalFlip(p=0.3),
+                transforms.ColorJitter(brightness=0.2, contrast=0.2),
+                transforms.ToTensor(),
+                transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])
+            ])
+        else:
+            self.transform = transforms.Compose([
+                transforms.Resize((img_size, img_size)),
+                transforms.ToTensor(),
+                transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])
+            ])
+    
+    def _scan_directory(self):
+        for cid, d in enumerate(sorted([d for d in self.root_dir.iterdir() if d.is_dir()])):
             self.classes.append(d.name)
-            self.class_to_idx[d.name] = cid
             files = list(d.glob("*.npz"))
             for f in files:
-                self.samples.append({'path': f, 'class_idx': cid, 'class_name': d.name})
-            logger.info(f"  {d.name}: {len(files)} videos")
-
-    def __len__(self):
-        return len(self.samples)
-
-    def load_video(self, npz_path):
+                self.samples.append((f, cid))
+        logger.info(f"Loaded {len(self.classes)} classes, {len(self.samples)} samples")
+    
+    def load_video(self, path):
         try:
-            data = np.load(npz_path)
-            if 'frames' in data:
-                frames = data['frames']
-            elif 'video' in data:
-                frames = data['video']
-            else:
-                frames = data[data.files[0]]
-
+            data = np.load(path)
+            frames = data['frames'] if 'frames' in data else data[data.files[0]]
             if frames.dtype != np.uint8:
-                if frames.max() <= 1.0:
-                    frames = (frames * 255).astype(np.uint8)
-                else:
-                    frames = np.clip(frames, 0, 255).astype(np.uint8)
+                frames = (frames * 255).astype(np.uint8) if frames.max() <= 1.0 else np.clip(frames, 0, 255).astype(np.uint8)
             return frames
-        except Exception as e:
-            logger.error(f"Error loading {npz_path}: {e}")
-            return np.zeros((self.num_frames, self.img_size, self.img_size, 3), dtype=np.uint8)
-
-    def temporal_sampling(self, frames):
-        n = len(frames)
-        if n == 0:
-            return np.zeros((self.num_frames, self.img_size, self.img_size, 3), dtype=np.uint8)
-        
-        if n <= self.num_frames:
-            indices = list(range(n)) + [n-1] * (self.num_frames - n)
-        else:
-            if self.is_training and random.random() > 0.3:
-                start = random.randint(0, max(0, n - self.num_frames))
-                indices = list(range(start, min(start + self.num_frames, n)))
-                if len(indices) < self.num_frames:
-                    indices += [indices[-1]] * (self.num_frames - len(indices))
-            else:
-                indices = np.linspace(0, n-1, self.num_frames, dtype=int)
-        return frames[indices]
-
-    def resize_frames(self, frames):
-        resized = []
-        for frame in frames:
-            resized.append(cv2.resize(frame, (self.img_size, self.img_size)))
-        return np.array(resized)
-
-    def apply_heavy_augmentations(self, frames):
-        if not self.is_training:
-            return frames
-
-        if random.random() > 0.3:
-            factor = random.uniform(0.6, 1.4)
-            frames = np.clip(frames * factor, 0, 255).astype(np.uint8)
-
-        if random.random() > 0.3:
-            factor = random.uniform(0.6, 1.4)
-            mean = frames.mean(axis=(1,2,3), keepdims=True)
-            frames = np.clip((frames - mean) * factor + mean, 0, 255).astype(np.uint8)
-
-        if random.random() > 0.5:
-            for i in range(len(frames)):
-                hsv = cv2.cvtColor(frames[i], cv2.COLOR_RGB2HSV).astype(np.float32)
-                hsv[:, :, 1] *= random.uniform(0.6, 1.4)
-                hsv[:, :, 1] = np.clip(hsv[:, :, 1], 0, 255)
-                frames[i] = cv2.cvtColor(hsv.astype(np.uint8), cv2.COLOR_HSV2RGB)
-
-        if random.random() > 0.5:
-            frames = frames[:, :, ::-1, :].copy()
-
-        if random.random() > 0.5:
-            angle = random.uniform(-15, 15)
-            h, w = frames.shape[1:3]
-            M = cv2.getRotationMatrix2D((w//2, h//2), angle, 1.0)
-            rotated = []
-            for frame in frames:
-                rotated.append(cv2.warpAffine(frame, M, (w, h)))
-            frames = np.array(rotated)
-
-        if random.random() > 0.5:
-            kernel_size = random.choice([3, 5, 7])
-            blurred = []
-            for frame in frames:
-                blurred.append(cv2.GaussianBlur(frame, (kernel_size, kernel_size), 0))
-            frames = np.array(blurred)
-
-        if random.random() > 0.4:
-            noise = np.random.normal(0, random.uniform(10, 25), frames.shape)
-            frames = np.clip(frames + noise, 0, 255).astype(np.uint8)
-
-        if random.random() > 0.4:
-            num_erase = random.randint(1, 3)
-            for _ in range(num_erase):
-                t_idx = random.randint(0, len(frames) - 1)
-                h, w = frames.shape[1:3]
-                x = random.randint(0, w - w//3)
-                y = random.randint(0, h - h//3)
-                w_erase = random.randint(w//6, w//3)
-                h_erase = random.randint(h//6, h//3)
-                frames[t_idx, y:y+h_erase, x:x+w_erase, :] = random.randint(0, 255)
-
-        if random.random() > 0.6:
-            num_drop = random.randint(1, 2)
-            drop_indices = random.sample(range(len(frames)), num_drop)
-            for idx in drop_indices:
-                if idx > 0:
-                    frames[idx] = frames[idx-1]
-
-        return frames
-
-    def normalize(self, frames):
-        frames = frames.astype(np.float32) / 255.0
-        mean = np.array([0.485, 0.456, 0.406])
-        std = np.array([0.229, 0.224, 0.225])
-        frames = (frames - mean) / std
-        return frames
-
+        except:
+            return np.zeros((self.num_frames, 112, 112, 3), dtype=np.uint8)
+    
+    def __len__(self): 
+        return len(self.samples)
+    
     def __getitem__(self, idx):
-        sample = self.samples[idx]
-        frames = self.load_video(sample['path'])
-        label = sample['class_idx']
-
-        frames = self.temporal_sampling(frames)
-        frames = self.resize_frames(frames)
+        path, label = self.samples[idx]
+        frames = self.load_video(path)
+        n = len(frames)
         
-        if self.is_training:
-            frames = self.apply_heavy_augmentations(frames)
-
-        frames = self.normalize(frames)
-        frames = torch.from_numpy(frames).permute(3, 0, 1, 2).float()
+        # Sample frames
+        if n == 0:
+            frames = np.zeros((self.num_frames, 112, 112, 3), dtype=np.uint8)
+        elif n <= self.num_frames:
+            indices = list(range(n)) + [n-1] * (self.num_frames - n)
+            frames = frames[indices]
+        else:
+            indices = np.linspace(0, n-1, self.num_frames, dtype=int)
+            frames = frames[indices]
         
-        return frames, label
+        video = torch.stack([self.transform(Image.fromarray(f)) for f in frames], dim=0)
+        return video, label
 
+# ===== ViViT MODEL =====
 
-# -------------------------
-# Model Components
-# -------------------------
-class PatchEmbed3D(nn.Module):
-    def __init__(self, img_size=96, patch_size=16, tubelet_size=2, in_chans=3, embed_dim=256):
+class SimplePatchEmbed(nn.Module):
+    """Patch embedding"""
+    def __init__(self, img_size=112, patch_size=14, embed_dim=160):
         super().__init__()
-        self.proj = nn.Conv3d(
-            in_chans, embed_dim,
-            kernel_size=(tubelet_size, patch_size, patch_size),
-            stride=(tubelet_size, patch_size, patch_size)
-        )
-        
+        self.n_patches = (img_size // patch_size) ** 2
+        self.proj = nn.Conv2d(3, embed_dim, kernel_size=patch_size, stride=patch_size)
+    
     def forward(self, x):
-        B, C, T, H, W = x.shape
         x = self.proj(x)
-        B, E, Tp, Hp, Wp = x.shape
         x = x.flatten(2).transpose(1, 2)
         return x
 
-
-class Attention(nn.Module):
-    def __init__(self, dim, num_heads=8, qkv_bias=True, attn_drop=0., proj_drop=0.):
+class SimpleAttention(nn.Module):
+    """Multi-head self-attention"""
+    def __init__(self, dim=160, heads=4, dropout=0.1):
         super().__init__()
-        self.num_heads = num_heads
-        head_dim = dim // num_heads
-        self.scale = head_dim ** -0.5
-
-        self.qkv = nn.Linear(dim, dim * 3, bias=qkv_bias)
-        self.attn_drop = nn.Dropout(attn_drop)
+        self.heads = heads
+        self.scale = (dim // heads) ** -0.5
+        self.qkv = nn.Linear(dim, dim * 3, bias=True)
         self.proj = nn.Linear(dim, dim)
-        self.proj_drop = nn.Dropout(proj_drop)
-
+        self.dropout = nn.Dropout(dropout)
+    
     def forward(self, x):
         B, N, C = x.shape
-        qkv = self.qkv(x).reshape(B, N, 3, self.num_heads, C // self.num_heads).permute(2, 0, 3, 1, 4)
+        qkv = self.qkv(x).reshape(B, N, 3, self.heads, C // self.heads).permute(2, 0, 3, 1, 4)
         q, k, v = qkv[0], qkv[1], qkv[2]
-
+        
         attn = (q @ k.transpose(-2, -1)) * self.scale
         attn = attn.softmax(dim=-1)
-        attn = self.attn_drop(attn)
-
+        attn = self.dropout(attn)
+        
         x = (attn @ v).transpose(1, 2).reshape(B, N, C)
         x = self.proj(x)
-        x = self.proj_drop(x)
+        x = self.dropout(x)
         return x
 
-
-class MLP(nn.Module):
-    def __init__(self, in_features, hidden_features=None, drop=0.):
-        super().__init__()
-        hidden_features = hidden_features or in_features * 4
-        self.fc1 = nn.Linear(in_features, hidden_features)
-        self.act = nn.GELU()
-        self.drop1 = nn.Dropout(drop)
-        self.fc2 = nn.Linear(hidden_features, in_features)
-        self.drop2 = nn.Dropout(drop)
-
-    def forward(self, x):
-        x = self.fc1(x)
-        x = self.act(x)
-        x = self.drop1(x)
-        x = self.fc2(x)
-        x = self.drop2(x)
-        return x
-
-
-class TransformerBlock(nn.Module):
-    def __init__(self, dim, num_heads, mlp_ratio=4., drop=0., attn_drop=0.):
+class SimpleBlock(nn.Module):
+    """Transformer block"""
+    def __init__(self, dim=160, heads=4, mlp_ratio=2.0, dropout=0.1):
         super().__init__()
         self.norm1 = nn.LayerNorm(dim)
-        self.attn = Attention(dim, num_heads=num_heads, attn_drop=attn_drop, proj_drop=drop)
+        self.attn = SimpleAttention(dim, heads, dropout)
         self.norm2 = nn.LayerNorm(dim)
-        self.mlp = MLP(in_features=dim, hidden_features=int(dim * mlp_ratio), drop=drop)
-
+        
+        hidden_dim = int(dim * mlp_ratio)
+        self.mlp = nn.Sequential(
+            nn.Linear(dim, hidden_dim),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_dim, dim),
+            nn.Dropout(dropout)
+        )
+    
     def forward(self, x):
         x = x + self.attn(self.norm1(x))
         x = x + self.mlp(self.norm2(x))
         return x
 
-
-class SlowLearningViViT(nn.Module):
-    def __init__(self, img_size=96, patch_size=16, tubelet_size=2, num_frames=8,
-                 in_chans=3, num_classes=1000, embed_dim=256, num_heads=8, num_layers=6,
-                 mlp_ratio=4., dropout=0.3, attention_dropout=0.3):
+class ViViT(nn.Module):
+    """Video Vision Transformer"""
+    def __init__(self, num_classes=36, num_frames=16, img_size=112, patch_size=14,
+                 embed_dim=160, spatial_depth=2, temporal_depth=2, heads=4, dropout=0.1):
         super().__init__()
+        self.num_frames = num_frames
+        self.embed_dim = embed_dim
         
-        self.patch_embed = PatchEmbed3D(
-            img_size=img_size, 
-            patch_size=patch_size,
-            tubelet_size=tubelet_size,
-            in_chans=in_chans, 
-            embed_dim=embed_dim
-        )
+        # Patch embedding
+        self.patch_embed = SimplePatchEmbed(img_size, patch_size, embed_dim)
+        n_patches = self.patch_embed.n_patches
         
-        num_patches = ((img_size // patch_size) ** 2) * (num_frames // tubelet_size)
+        # Learnable embeddings
+        self.spatial_cls = nn.Parameter(torch.randn(1, 1, embed_dim) * 0.02)
+        self.temporal_cls = nn.Parameter(torch.randn(1, 1, embed_dim) * 0.02)
+        self.spatial_pos = nn.Parameter(torch.randn(1, n_patches + 1, embed_dim) * 0.02)
+        self.temporal_pos = nn.Parameter(torch.randn(1, num_frames + 1, embed_dim) * 0.02)
         
-        self.pos_embed = nn.Parameter(torch.zeros(1, num_patches, embed_dim))
-        self.pos_drop = nn.Dropout(p=dropout)
-        
-        self.blocks = nn.ModuleList([
-            TransformerBlock(
-                dim=embed_dim,
-                num_heads=num_heads,
-                mlp_ratio=mlp_ratio,
-                drop=dropout,
-                attn_drop=attention_dropout
-            )
-            for _ in range(num_layers)
+        # Transformers
+        self.spatial_blocks = nn.ModuleList([
+            SimpleBlock(embed_dim, heads, 2.0, dropout) for _ in range(spatial_depth)
+        ])
+        self.temporal_blocks = nn.ModuleList([
+            SimpleBlock(embed_dim, heads, 2.0, dropout) for _ in range(temporal_depth)
         ])
         
+        # Classification head
         self.norm = nn.LayerNorm(embed_dim)
-        
         self.head = nn.Sequential(
-            nn.Dropout(0.4),
-            nn.Linear(embed_dim, num_classes)
+            nn.Linear(embed_dim, embed_dim // 2),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(embed_dim // 2, num_classes)
         )
         
-        self._init_weights()
-        
-        logger.info(f"SlowLearningViViT: {embed_dim}D, {num_layers} layers")
-        logger.info(f"Dropout: {dropout}")
-        logger.info(f"Params: {sum(p.numel() for p in self.parameters()):,}")
+        # Initialize weights
+        self.apply(self._init_weights)
     
-    def _init_weights(self):
-        nn.init.trunc_normal_(self.pos_embed, std=0.02)
-        self.apply(self._init_weights_module)
-    
-    def _init_weights_module(self, m):
+    def _init_weights(self, m):
         if isinstance(m, nn.Linear):
-            nn.init.trunc_normal_(m.weight, std=0.02)
+            nn.init.xavier_uniform_(m.weight)
             if m.bias is not None:
-                nn.init.zeros_(m.bias)
+                nn.init.constant_(m.bias, 0)
         elif isinstance(m, nn.LayerNorm):
-            nn.init.zeros_(m.bias)
-            nn.init.ones_(m.weight)
+            nn.init.constant_(m.bias, 0)
+            nn.init.constant_(m.weight, 1.0)
+        elif isinstance(m, nn.Conv2d):
+            nn.init.kaiming_normal_(m.weight, mode='fan_out')
+            if m.bias is not None:
+                nn.init.constant_(m.bias, 0)
     
     def forward(self, x):
-        x = self.patch_embed(x)
-        x = x + self.pos_embed
-        x = self.pos_drop(x)
+        B, T, C, H, W = x.shape
         
-        for block in self.blocks:
+        # Spatial processing
+        x = x.view(B * T, C, H, W)
+        x = self.patch_embed(x)
+        
+        cls_tokens = self.spatial_cls.expand(B * T, -1, -1)
+        x = torch.cat([cls_tokens, x], dim=1)
+        x = x + self.spatial_pos
+        
+        for block in self.spatial_blocks:
             x = block(x)
         
+        x = x[:, 0]
+        
+        # Temporal processing
+        x = x.view(B, T, self.embed_dim)
+        
+        temporal_cls = self.temporal_cls.expand(B, -1, -1)
+        x = torch.cat([temporal_cls, x], dim=1)
+        x = x + self.temporal_pos
+        
+        for block in self.temporal_blocks:
+            x = block(x)
+        
+        # Classification
+        x = x[:, 0]
         x = self.norm(x)
-        x = x.mean(dim=1)
         x = self.head(x)
+        
         return x
 
+# ===== TRAINING FUNCTIONS =====
 
-# -------------------------
-# Label Smoothing
-# -------------------------
-class LabelSmoothingCrossEntropy(nn.Module):
-    def __init__(self, smoothing=0.2):
-        super().__init__()
-        self.smoothing = smoothing
-        self.confidence = 1.0 - smoothing
-        
-    def forward(self, pred, target):
-        pred = pred.log_softmax(dim=-1)
-        with torch.no_grad():
-            true_dist = torch.zeros_like(pred)
-            true_dist.fill_(self.smoothing / (pred.size(-1) - 1))
-            true_dist.scatter_(1, target.data.unsqueeze(1), self.confidence)
-        return torch.mean(torch.sum(-true_dist * pred, dim=-1))
-
-
-# -------------------------
-# Warmup Scheduler
-# -------------------------
-class WarmupCosineScheduler:
-    def __init__(self, optimizer, warmup_epochs, total_epochs, base_lr, min_lr=1e-7):
-        self.optimizer = optimizer
-        self.warmup_epochs = warmup_epochs
-        self.total_epochs = total_epochs
-        self.base_lr = base_lr
-        self.min_lr = min_lr
-        self.current_epoch = 0
-        
-    def step(self):
-        self.current_epoch += 1
-        
-        if self.current_epoch <= self.warmup_epochs:
-            lr = self.base_lr * self.current_epoch / self.warmup_epochs
-        else:
-            progress = (self.current_epoch - self.warmup_epochs) / (self.total_epochs - self.warmup_epochs)
-            lr = self.min_lr + (self.base_lr - self.min_lr) * 0.5 * (1 + math.cos(math.pi * progress))
-        
-        for param_group in self.optimizer.param_groups:
-            param_group['lr'] = lr
-        return lr
-
-
-# -------------------------
-# Plotting Functions
-# -------------------------
-class TrainingPlotter:
-    def __init__(self, plot_dir):
-        self.plot_dir = Path(plot_dir)
-        self.plot_dir.mkdir(parents=True, exist_ok=True)
-        logger.info(f"📊 Plots will be saved to: {self.plot_dir}")
+def train_epoch(model, loader, optimizer, criterion, device, gradient_clip):
+    model.train()
+    total_loss, correct, total = 0.0, 0, 0
     
-    def plot_loss_curves(self, train_losses, val_losses, epoch):
-        """Plot training and validation loss curves"""
-        plt.figure(figsize=(12, 6))
-        epochs = range(1, len(train_losses) + 1)
+    for inputs, labels in tqdm(loader, desc="Training", leave=False):
+        inputs, labels = inputs.to(device), labels.to(device)
         
-        plt.plot(epochs, train_losses, 'b-', label='Training Loss', linewidth=2)
-        plt.plot(epochs, val_losses, 'r-', label='Validation Loss', linewidth=2)
+        optimizer.zero_grad()
+        outputs = model(inputs)
+        loss = criterion(outputs, labels)
         
-        plt.title('Training and Validation Loss', fontsize=16, fontweight='bold')
-        plt.xlabel('Epoch', fontsize=12)
-        plt.ylabel('Loss', fontsize=12)
-        plt.legend(fontsize=12)
-        plt.grid(True, alpha=0.3)
-        plt.tight_layout()
+        loss.backward()
+        torch.nn.utils.clip_grad_norm_(model.parameters(), gradient_clip)
+        optimizer.step()
         
-        plt.savefig(self.plot_dir / f'loss_curves_epoch_{epoch}.png', dpi=150, bbox_inches='tight')
-        plt.close()
+        total_loss += loss.item()
+        _, preds = outputs.max(1)
+        correct += preds.eq(labels).sum().item()
+        total += labels.size(0)
     
-    def plot_accuracy_curves(self, train_accs, val_accs, epoch):
-        """Plot training and validation accuracy curves"""
-        plt.figure(figsize=(12, 6))
-        epochs = range(1, len(train_accs) + 1)
-        
-        train_accs_pct = [acc * 100 for acc in train_accs]
-        val_accs_pct = [acc * 100 for acc in val_accs]
-        
-        plt.plot(epochs, train_accs_pct, 'b-', label='Training Accuracy', linewidth=2)
-        plt.plot(epochs, val_accs_pct, 'r-', label='Validation Accuracy', linewidth=2)
-        
-        # Add target zone
-        plt.axhspan(85, 90, alpha=0.2, color='green', label='Target Zone (85-90%)')
-        
-        plt.title('Training and Validation Accuracy', fontsize=16, fontweight='bold')
-        plt.xlabel('Epoch', fontsize=12)
-        plt.ylabel('Accuracy (%)', fontsize=12)
-        plt.legend(fontsize=12)
-        plt.grid(True, alpha=0.3)
-        plt.ylim([0, 105])
-        plt.tight_layout()
-        
-        plt.savefig(self.plot_dir / f'accuracy_curves_epoch_{epoch}.png', dpi=150, bbox_inches='tight')
-        plt.close()
+    return total_loss / len(loader), correct / total
+
+def evaluate(model, loader, criterion, device):
+    model.eval()
+    total_loss, correct, total = 0.0, 0, 0
+    all_preds, all_labels = [], []
     
-    def plot_overfitting_gap(self, train_accs, val_accs, epoch):
-        """Plot the gap between training and validation accuracy"""
-        plt.figure(figsize=(12, 6))
-        epochs = range(1, len(train_accs) + 1)
-        
-        gaps = [(train - val) * 100 for train, val in zip(train_accs, val_accs)]
-        
-        plt.plot(epochs, gaps, 'purple', linewidth=2, marker='o', markersize=4)
-        plt.fill_between(epochs, gaps, 0, alpha=0.3, color='purple')
-        
-        plt.title('Overfitting Gap (Train Acc - Val Acc)', fontsize=16, fontweight='bold')
-        plt.xlabel('Epoch', fontsize=12)
-        plt.ylabel('Gap (%)', fontsize=12)
-        plt.grid(True, alpha=0.3)
-        plt.axhline(y=0, color='black', linestyle='--', linewidth=1)
-        plt.tight_layout()
-        
-        plt.savefig(self.plot_dir / f'overfitting_gap_epoch_{epoch}.png', dpi=150, bbox_inches='tight')
-        plt.close()
-    
-    def plot_learning_rate(self, lr_history, epoch):
-        """Plot learning rate schedule"""
-        plt.figure(figsize=(12, 6))
-        epochs = range(1, len(lr_history) + 1)
-        
-        plt.plot(epochs, lr_history, 'green', linewidth=2)
-        plt.title('Learning Rate Schedule', fontsize=16, fontweight='bold')
-        plt.xlabel('Epoch', fontsize=12)
-        plt.ylabel('Learning Rate', fontsize=12)
-        plt.yscale('log')
-        plt.grid(True, alpha=0.3)
-        plt.tight_layout()
-        
-        plt.savefig(self.plot_dir / f'learning_rate_epoch_{epoch}.png', dpi=150, bbox_inches='tight')
-        plt.close()
-    
-    def plot_combined_metrics(self, train_losses, val_losses, train_accs, val_accs, lr_history, epoch):
-        """Plot all metrics in a single figure"""
-        fig, axes = plt.subplots(2, 2, figsize=(16, 12))
-        epochs = range(1, len(train_losses) + 1)
-        
-        # Loss curves
-        axes[0, 0].plot(epochs, train_losses, 'b-', label='Train', linewidth=2)
-        axes[0, 0].plot(epochs, val_losses, 'r-', label='Val', linewidth=2)
-        axes[0, 0].set_title('Loss Curves', fontsize=14, fontweight='bold')
-        axes[0, 0].set_xlabel('Epoch')
-        axes[0, 0].set_ylabel('Loss')
-        axes[0, 0].legend()
-        axes[0, 0].grid(True, alpha=0.3)
-        
-        # Accuracy curves
-        train_accs_pct = [acc * 100 for acc in train_accs]
-        val_accs_pct = [acc * 100 for acc in val_accs]
-        axes[0, 1].plot(epochs, train_accs_pct, 'b-', label='Train', linewidth=2)
-        axes[0, 1].plot(epochs, val_accs_pct, 'r-', label='Val', linewidth=2)
-        axes[0, 1].axhspan(85, 90, alpha=0.2, color='green', label='Target')
-        axes[0, 1].set_title('Accuracy Curves', fontsize=14, fontweight='bold')
-        axes[0, 1].set_xlabel('Epoch')
-        axes[0, 1].set_ylabel('Accuracy (%)')
-        axes[0, 1].legend()
-        axes[0, 1].grid(True, alpha=0.3)
-        axes[0, 1].set_ylim([0, 105])
-        
-        # Overfitting gap
-        gaps = [(train - val) * 100 for train, val in zip(train_accs, val_accs)]
-        axes[1, 0].plot(epochs, gaps, 'purple', linewidth=2, marker='o', markersize=3)
-        axes[1, 0].fill_between(epochs, gaps, 0, alpha=0.3, color='purple')
-        axes[1, 0].set_title('Overfitting Gap', fontsize=14, fontweight='bold')
-        axes[1, 0].set_xlabel('Epoch')
-        axes[1, 0].set_ylabel('Gap (%)')
-        axes[1, 0].grid(True, alpha=0.3)
-        axes[1, 0].axhline(y=0, color='black', linestyle='--', linewidth=1)
-        
-        # Learning rate
-        axes[1, 1].plot(epochs, lr_history, 'green', linewidth=2)
-        axes[1, 1].set_title('Learning Rate Schedule', fontsize=14, fontweight='bold')
-        axes[1, 1].set_xlabel('Epoch')
-        axes[1, 1].set_ylabel('Learning Rate')
-        axes[1, 1].set_yscale('log')
-        axes[1, 1].grid(True, alpha=0.3)
-        
-        plt.tight_layout()
-        plt.savefig(self.plot_dir / f'combined_metrics_epoch_{epoch}.png', dpi=150, bbox_inches='tight')
-        plt.close()
-    
-    def plot_metrics_table(self, train_losses, val_losses, train_accs, val_accs, epoch):
-        """Create a table showing metrics progression"""
-        fig, ax = plt.subplots(figsize=(14, max(10, len(train_losses) * 0.5)))
-        ax.axis('tight')
-        ax.axis('off')
-        
-        # Prepare data
-        data = []
-        for i, (tl, vl, ta, va) in enumerate(zip(train_losses, val_losses, train_accs, val_accs), 1):
-            gap = (ta - va) * 100
-            data.append([
-                i,
-                f"{tl:.4f}",
-                f"{vl:.4f}",
-                f"{ta*100:.2f}%",
-                f"{va*100:.2f}%",
-                f"{gap:.2f}%"
-            ])
-        
-        # Create table
-        table = ax.table(
-            cellText=data,
-            colLabels=['Epoch', 'Train Loss', 'Val Loss', 'Train Acc', 'Val Acc', 'Gap'],
-            cellLoc='center',
-            loc='center',
-            colWidths=[0.1, 0.18, 0.18, 0.18, 0.18, 0.18]
-        )
-        
-        table.auto_set_font_size(False)
-        table.set_fontsize(9)
-        table.scale(1, 2)
-        
-        # Style header
-        for i in range(6):
-            table[(0, i)].set_facecolor('#4CAF50')
-            table[(0, i)].set_text_props(weight='bold', color='white')
-        
-        # Alternate row colors
-        for i in range(1, len(data) + 1):
-            for j in range(6):
-                if i % 2 == 0:
-                    table[(i, j)].set_facecolor('#f0f0f0')
-        
-        plt.title('Training Metrics Summary', fontsize=16, fontweight='bold', pad=20)
-        plt.savefig(self.plot_dir / f'metrics_table_epoch_{epoch}.png', dpi=150, bbox_inches='tight')
-        plt.close()
-    
-    def plot_final_summary(self, train_losses, val_losses, train_accs, val_accs, lr_history, best_val_acc, config):
-        """Create a comprehensive final summary plot"""
-        fig = plt.figure(figsize=(20, 12))
-        gs = fig.add_gridspec(3, 3, hspace=0.3, wspace=0.3)
-        
-        epochs = range(1, len(train_losses) + 1)
-        
-        # Loss curves
-        ax1 = fig.add_subplot(gs[0, :2])
-        ax1.plot(epochs, train_losses, 'b-', label='Training Loss', linewidth=2)
-        ax1.plot(epochs, val_losses, 'r-', label='Validation Loss', linewidth=2)
-        ax1.set_title('Loss Curves', fontsize=14, fontweight='bold')
-        ax1.set_xlabel('Epoch')
-        ax1.set_ylabel('Loss')
-        ax1.legend()
-        ax1.grid(True, alpha=0.3)
-        
-        # Accuracy curves
-        ax2 = fig.add_subplot(gs[1, :2])
-        train_accs_pct = [acc * 100 for acc in train_accs]
-        val_accs_pct = [acc * 100 for acc in val_accs]
-        ax2.plot(epochs, train_accs_pct, 'b-', label='Training Accuracy', linewidth=2)
-        ax2.plot(epochs, val_accs_pct, 'r-', label='Validation Accuracy', linewidth=2)
-        ax2.axhspan(85, 90, alpha=0.2, color='green', label='Target Zone')
-        ax2.axhline(y=best_val_acc*100, color='gold', linestyle='--', linewidth=2, label=f'Best: {best_val_acc*100:.2f}%')
-        ax2.set_title('Accuracy Curves', fontsize=14, fontweight='bold')
-        ax2.set_xlabel('Epoch')
-        ax2.set_ylabel('Accuracy (%)')
-        ax2.legend()
-        ax2.grid(True, alpha=0.3)
-        ax2.set_ylim([0, 105])
-        
-        # Overfitting gap
-        ax3 = fig.add_subplot(gs[2, :2])
-        gaps = [(train - val) * 100 for train, val in zip(train_accs, val_accs)]
-        ax3.plot(epochs, gaps, 'purple', linewidth=2, marker='o', markersize=3)
-        ax3.fill_between(epochs, gaps, 0, alpha=0.3, color='purple')
-        ax3.set_title('Overfitting Gap', fontsize=14, fontweight='bold')
-        ax3.set_xlabel('Epoch')
-        ax3.set_ylabel('Gap (%)')
-        ax3.grid(True, alpha=0.3)
-        ax3.axhline(y=0, color='black', linestyle='--', linewidth=1)
-        
-        # Learning rate
-        ax4 = fig.add_subplot(gs[0, 2])
-        ax4.plot(epochs, lr_history, 'green', linewidth=2)
-        ax4.set_title('Learning Rate', fontsize=12, fontweight='bold')
-        ax4.set_xlabel('Epoch')
-        ax4.set_ylabel('LR')
-        ax4.set_yscale('log')
-        ax4.grid(True, alpha=0.3)
-        
-        # Summary statistics
-        ax5 = fig.add_subplot(gs[1, 2])
-        ax5.axis('off')
-        summary_text = f"""
-TRAINING SUMMARY
-{'='*25}
-
-Best Val Acc: {best_val_acc*100:.2f}%
-Final Train Acc: {train_accs[-1]*100:.2f}%
-Final Val Acc: {val_accs[-1]*100:.2f}%
-Final Gap: {gaps[-1]:.2f}%
-
-Min Train Loss: {min(train_losses):.4f}
-Min Val Loss: {min(val_losses):.4f}
-
-Total Epochs: {len(train_losses)}
-"""
-        ax5.text(0.1, 0.9, summary_text, transform=ax5.transAxes,
-                fontsize=10, verticalalignment='top', fontfamily='monospace',
-                bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.5))
-        
-        # Configuration
-        ax6 = fig.add_subplot(gs[2, 2])
-        ax6.axis('off')
-        config_text = f"""
-MODEL CONFIG
-{'='*25}
-
-Image Size: {config['img_size']}x{config['img_size']}
-Frames: {config['num_frames']}
-Embed Dim: {config['embed_dim']}
-Layers: {config['num_layers']}
-Heads: {config['num_heads']}
-
-Learning Rate: {config['learning_rate']:.0e}
-Dropout: {config['dropout_rate']}
-Batch Size: {config['batch_size']}
-Weight Decay: {config['weight_decay']}
-"""
-        ax6.text(0.1, 0.9, config_text, transform=ax6.transAxes,
-                fontsize=9, verticalalignment='top', fontfamily='monospace',
-                bbox=dict(boxstyle='round', facecolor='lightblue', alpha=0.5))
-        
-        plt.suptitle('ViViT Training - Final Summary', fontsize=18, fontweight='bold', y=0.98)
-        plt.savefig(self.plot_dir / 'final_summary.png', dpi=150, bbox_inches='tight')
-        plt.close()
-        
-        logger.info("✓ Final summary plot saved")
-    
-    def plot_per_epoch_comparison(self, train_losses, val_losses, train_accs, val_accs, epoch):
-        """Bar chart comparing train vs val for current epoch"""
-        fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(14, 6))
-        
-        # Loss comparison
-        categories = ['Train', 'Validation']
-        losses = [train_losses[-1], val_losses[-1]]
-        colors = ['blue', 'red']
-        
-        bars1 = ax1.bar(categories, losses, color=colors, alpha=0.7, edgecolor='black', linewidth=2)
-        ax1.set_title(f'Loss Comparison - Epoch {epoch}', fontsize=14, fontweight='bold')
-        ax1.set_ylabel('Loss')
-        ax1.grid(True, alpha=0.3, axis='y')
-        
-        for bar, loss in zip(bars1, losses):
-            height = bar.get_height()
-            ax1.text(bar.get_x() + bar.get_width()/2., height,
-                    f'{loss:.4f}', ha='center', va='bottom', fontsize=12, fontweight='bold')
-        
-        # Accuracy comparison
-        accs = [train_accs[-1] * 100, val_accs[-1] * 100]
-        bars2 = ax2.bar(categories, accs, color=colors, alpha=0.7, edgecolor='black', linewidth=2)
-        ax2.set_title(f'Accuracy Comparison - Epoch {epoch}', fontsize=14, fontweight='bold')
-        ax2.set_ylabel('Accuracy (%)')
-        ax2.set_ylim([0, 105])
-        ax2.axhline(y=85, color='green', linestyle='--', alpha=0.5, label='Target Min')
-        ax2.axhline(y=90, color='green', linestyle='--', alpha=0.5, label='Target Max')
-        ax2.grid(True, alpha=0.3, axis='y')
-        ax2.legend()
-        
-        for bar, acc in zip(bars2, accs):
-            height = bar.get_height()
-            ax2.text(bar.get_x() + bar.get_width()/2., height,
-                    f'{acc:.2f}%', ha='center', va='bottom', fontsize=12, fontweight='bold')
-        
-        plt.tight_layout()
-        plt.savefig(self.plot_dir / f'epoch_{epoch}_comparison.png', dpi=150, bbox_inches='tight')
-        plt.close()
-    
-    def save_metrics_csv(self, train_losses, val_losses, train_accs, val_accs, lr_history):
-        """Save all metrics to CSV"""
-        df = pd.DataFrame({
-            'epoch': range(1, len(train_losses) + 1),
-            'train_loss': train_losses,
-            'val_loss': val_losses,
-            'train_accuracy': [acc * 100 for acc in train_accs],
-            'val_accuracy': [acc * 100 for acc in val_accs],
-            'accuracy_gap': [(ta - va) * 100 for ta, va in zip(train_accs, val_accs)],
-            'learning_rate': lr_history
-        })
-        
-        csv_path = self.plot_dir / 'training_metrics.csv'
-        df.to_csv(csv_path, index=False)
-        logger.info(f"✓ Metrics saved to: {csv_path}")
-
-
-# -------------------------
-# Trainer with Plotting
-# -------------------------
-class Trainer:
-    def __init__(self, config):
-        self.cfg = config
-        
-        if not torch.cuda.is_available():
-            raise RuntimeError("CUDA not available")
-        
-        self.device = torch.device('cuda')
-        self.n_gpus = torch.cuda.device_count()
-        
-        logger.info(f"Found {self.n_gpus} GPU(s)")
-
-        self.save_dir = Path(self.cfg['save_dir'])
-        self.save_dir.mkdir(parents=True, exist_ok=True)
-        
-        # Create plot directory
-        self.plot_dir = self.save_dir / 'plots'
-        self.plotter = TrainingPlotter(self.plot_dir)
-
-        self.scaler = GradScaler()
-        self.writer = SummaryWriter(log_dir=str(self.save_dir / "logs" / datetime.now().strftime("%Y%m%d-%H%M%S")))
-
-        self.train_losses = []
-        self.val_losses = []
-        self.train_accs = []
-        self.val_accs = []
-        self.lr_history = []
-        self.best_val_acc = 0.0
-        self.model = None
-
-    def create_data_loaders(self):
-        train_ds = NPZDirectoryDataset(
-            self.cfg['train_dir'], 
-            num_frames=self.cfg['num_frames'], 
-            is_training=True,
-            img_size=self.cfg['img_size']
-        )
-        
-        val_ds = NPZDirectoryDataset(
-            self.cfg['val_dir'], 
-            num_frames=self.cfg['num_frames'], 
-            is_training=False,
-            img_size=self.cfg['img_size']
-        )
-
-        self.class_names = train_ds.classes
-        self.num_classes = len(self.class_names)
-        logger.info(f"Total classes: {self.num_classes}")
-
-        train_loader = DataLoader(
-            train_ds, 
-            batch_size=self.cfg['batch_size'], 
-            shuffle=True,
-            num_workers=self.cfg['num_workers'], 
-            pin_memory=True,
-            drop_last=True
-        )
-        
-        val_loader = DataLoader(
-            val_ds, 
-            batch_size=self.cfg['batch_size'],
-            shuffle=False,
-            num_workers=self.cfg['num_workers'], 
-            pin_memory=True
-        )
-        
-        return train_loader, val_loader
-
-    def train_epoch(self, model, loader, optimizer, criterion, epoch):
-        model.train()
-        total_loss = 0.0
-        correct = 0
-        total = 0
-        skipped = 0
-
-        pbar = tqdm(loader, desc=f"Epoch {epoch}")
-        for batch_idx, (inputs, labels) in enumerate(pbar):
-            inputs = inputs.to(self.device, non_blocking=True)
-            labels = labels.to(self.device, non_blocking=True)
-
-            optimizer.zero_grad(set_to_none=True)
-
-            with autocast():
-                outputs = model(inputs)
-                loss = criterion(outputs, labels)
+    with torch.no_grad():
+        for inputs, labels in tqdm(loader, desc="Validating", leave=False):
+            inputs, labels = inputs.to(device), labels.to(device)
+            outputs = model(inputs)
+            loss = criterion(outputs, labels)
             
-            if not torch.isfinite(loss):
-                logger.warning(f"NaN/Inf loss at batch {batch_idx}")
-                skipped += 1
-                continue
-            
-            self.scaler.scale(loss).backward()
-            self.scaler.unscale_(optimizer)
-            grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-            
-            if not torch.isfinite(grad_norm):
-                logger.warning(f"NaN/Inf gradients at batch {batch_idx}")
-                optimizer.zero_grad(set_to_none=True)
-                self.scaler.update()
-                skipped += 1
-                continue
-            
-            self.scaler.step(optimizer)
-            self.scaler.update()
-
             total_loss += loss.item()
             _, preds = outputs.max(1)
             correct += preds.eq(labels).sum().item()
             total += labels.size(0)
-
-            if batch_idx % 20 == 0:
-                pbar.set_postfix({
-                    'loss': f"{total_loss/(batch_idx+1-skipped):.4f}", 
-                    'acc': f"{100.*correct/total:.2f}%",
-                    'lr': f"{optimizer.param_groups[0]['lr']:.6f}"
-                })
-
-        epoch_loss = total_loss / max(1, len(loader) - skipped)
-        epoch_acc = correct / total if total > 0 else 0.0
-
-        return epoch_loss, epoch_acc
-
-    def evaluate(self, model, loader, criterion):
-        model.eval()
-        total_loss = 0.0
-        correct = 0
-        total = 0
-
-        with torch.no_grad():
-            for inputs, labels in tqdm(loader, desc="Validation", leave=False):
-                inputs = inputs.to(self.device, non_blocking=True)
-                labels = labels.to(self.device, non_blocking=True)
-
-                with autocast():
-                    outputs = model(inputs)
-                    loss = criterion(outputs, labels)
-                
-                total_loss += loss.item()
-                _, preds = outputs.max(1)
-                correct += preds.eq(labels).sum().item()
-                total += labels.size(0)
-
-        epoch_loss = total_loss / len(loader)
-        epoch_acc = correct / total
-
-        return epoch_loss, epoch_acc
-
-    def train(self):
-        train_loader, val_loader = self.create_data_loaders()
-
-        model = SlowLearningViViT(
-            img_size=self.cfg['img_size'],
-            patch_size=self.cfg['patch_size'],
-            tubelet_size=self.cfg['tubelet_size'],
-            num_frames=self.cfg['num_frames'],
-            in_chans=3,
-            num_classes=self.num_classes,
-            embed_dim=self.cfg['embed_dim'],
-            num_heads=self.cfg['num_heads'],
-            num_layers=self.cfg['num_layers'],
-            mlp_ratio=self.cfg['mlp_ratio'],
-            dropout=self.cfg['dropout_rate'],
-            attention_dropout=self.cfg['attention_dropout']
-        )
-
-        if self.n_gpus > 1:
-            model = nn.DataParallel(model)
-        model = model.to(self.device)
-        self.model = model
-
-        total_params = sum(p.numel() for p in model.parameters())
-        logger.info(f"Total params: {total_params:,}")
-
-        optimizer = optim.AdamW(
-            model.parameters(),
-            lr=self.cfg['learning_rate'], 
-            weight_decay=self.cfg['weight_decay'],
-            betas=(0.9, 0.999)
-        )
-        
-        scheduler = WarmupCosineScheduler(
-            optimizer,
-            warmup_epochs=self.cfg['warmup_epochs'],
-            total_epochs=self.cfg['epochs'],
-            base_lr=self.cfg['learning_rate'],
-            min_lr=self.cfg['min_lr']
-        )
-        
-        criterion = LabelSmoothingCrossEntropy(smoothing=self.cfg['label_smoothing'])
-
-        logger.info("\nStarting training...")
-        for epoch in range(1, self.cfg['epochs'] + 1):
-            current_lr = scheduler.step()
-            self.lr_history.append(current_lr)
             
-            train_loss, train_acc = self.train_epoch(model, train_loader, optimizer, criterion, epoch)
-            val_loss, val_acc = self.evaluate(model, val_loader, criterion)
+            all_preds.extend(preds.cpu().numpy())
+            all_labels.extend(labels.cpu().numpy())
+    
+    acc = correct / total
+    f1 = f1_score(all_labels, all_preds, average='macro', zero_division=0)
+    
+    return total_loss / len(loader), acc, f1
 
-            self.train_losses.append(train_loss)
-            self.val_losses.append(val_loss)
-            self.train_accs.append(train_acc)
-            self.val_accs.append(val_acc)
+# ===== OPTUNA OBJECTIVE =====
 
-            logger.info(f"\nEpoch {epoch}/{self.cfg['epochs']}")
-            logger.info(f"Train - Loss: {train_loss:.4f}, Acc: {train_acc*100:.2f}%")
-            logger.info(f"Val   - Loss: {val_loss:.4f}, Acc: {val_acc*100:.2f}%")
-            logger.info(f"Gap: {(train_acc - val_acc)*100:.2f}%")
-            logger.info(f"LR: {current_lr:.6f}")
-
-            self.writer.add_scalar("Train/Loss", train_loss, epoch)
-            self.writer.add_scalar("Train/Accuracy", train_acc, epoch)
-            self.writer.add_scalar("Val/Loss", val_loss, epoch)
-            self.writer.add_scalar("Val/Accuracy", val_acc, epoch)
-            self.writer.add_scalar("LR", current_lr, epoch)
-
-            # Generate plots every epoch
-            logger.info("📊 Generating plots...")
-            self.plotter.plot_loss_curves(self.train_losses, self.val_losses, epoch)
-            self.plotter.plot_accuracy_curves(self.train_accs, self.val_accs, epoch)
-            self.plotter.plot_overfitting_gap(self.train_accs, self.val_accs, epoch)
-            self.plotter.plot_learning_rate(self.lr_history, epoch)
-            
-            # Generate combined plot every 5 epochs
-            if epoch % 5 == 0 or epoch == 1:
-                self.plotter.plot_combined_metrics(
-                    self.train_losses, self.val_losses, 
-                    self.train_accs, self.val_accs, 
-                    self.lr_history, epoch
-                )
-                self.plotter.plot_per_epoch_comparison(
-                    self.train_losses, self.val_losses,
-                    self.train_accs, self.val_accs, epoch
-                )
-                self.plotter.plot_metrics_table(
-                    self.train_losses, self.val_losses,
-                    self.train_accs, self.val_accs, epoch
-                )
-
-            if val_acc > self.best_val_acc:
-                self.best_val_acc = val_acc
-                model_state = model.module.state_dict() if isinstance(model, nn.DataParallel) else model.state_dict()
-                torch.save({
-                    'epoch': epoch,
-                    'model_state_dict': model_state,
-                    'optimizer_state_dict': optimizer.state_dict(),
-                    'val_accuracy': val_acc,
-                    'config': self.cfg,
-                }, self.save_dir / "best_model.pth")
-                logger.info(f"✓ New best! Val Acc: {val_acc*100:.2f}%")
-            
-            if epoch % 5 == 0:
-                model_state = model.module.state_dict() if isinstance(model, nn.DataParallel) else model.state_dict()
-                torch.save({
-                    'epoch': epoch,
-                    'model_state_dict': model_state,
-                    'optimizer_state_dict': optimizer.state_dict(),
-                    'val_accuracy': val_acc,
-                    'config': self.cfg,
-                }, self.save_dir / f"checkpoint_epoch_{epoch}.pth")
-                logger.info(f"💾 Checkpoint saved: epoch_{epoch}")
-
-        # Generate final summary plots
-        logger.info("\n📊 Generating final summary plots...")
-        self.plotter.plot_final_summary(
-            self.train_losses, self.val_losses,
-            self.train_accs, self.val_accs,
-            self.lr_history, self.best_val_acc, self.cfg
-        )
-        self.plotter.save_metrics_csv(
-            self.train_losses, self.val_losses,
-            self.train_accs, self.val_accs,
-            self.lr_history
-        )
-
-        self.writer.close()
-        logger.info(f"\n✓ Training Complete! Best Val Acc: {self.best_val_acc*100:.2f}%")
-        logger.info(f"✓ All plots saved to: {self.plot_dir}")
-        
-        return model
-
-
-# -------------------------
-# Main
-# -------------------------
-def main():
-    config = {
-        # DATA
-        'train_dir': '/kaggle/input/npz-lightweight-videos-without-cropping-dataset/npz_lightweight_videos_without_cropping_splitted_dataset/train',
-        'val_dir': '/kaggle/input/npz-lightweight-videos-without-cropping-dataset/npz_lightweight_videos_without_cropping_splitted_dataset/val',
-        'save_dir': '/kaggle/working/',
-
-        # MODEL
-        'img_size': 112,
-        'patch_size': 16,
-        'tubelet_size': 2,
-        'num_frames': 8,
-        'embed_dim': 256,
-        'num_heads': 8,
-        'num_layers': 6,
-        'mlp_ratio': 4.0,
-        
-        # REGULARIZATION
-        'dropout_rate': 0.2,
-        'attention_dropout': 0.3,
-        'label_smoothing': 0.2,
-
-        # TRAINING
-        'batch_size': 16,
-        'epochs': 50,
-        'learning_rate': 2e-4,
-        'min_lr': 1e-7,
-        'warmup_epochs': 10,
-        'weight_decay': 0.15,
-
-        # SYSTEM
-        'num_workers': 4,
-    }
-
-    logger.info("\n" + "="*80)
-    logger.info("VIVIT CONFIGURED FOR 85-90% AT EPOCH 50 - WITH PLOTTING")
-    logger.info("="*80)
-    logger.info("\nPLOTS WILL INCLUDE:")
-    logger.info("  ✓ Loss curves (train & val)")
-    logger.info("  ✓ Accuracy curves (train & val)")
-    logger.info("  ✓ Overfitting gap analysis")
-    logger.info("  ✓ Learning rate schedule")
-    logger.info("  ✓ Combined metrics dashboard")
-    logger.info("  ✓ Per-epoch comparisons")
-    logger.info("  ✓ Metrics summary table")
-    logger.info("  ✓ Final comprehensive summary")
-    logger.info("  ✓ CSV export of all metrics")
-    logger.info("="*80 + "\n")
-
-    trainer = Trainer(config)
+def objective(trial, train_dir, val_dir, n_trials_epochs=15):
+    """
+    Optuna objective function for hyperparameter optimization
+    Uses reduced epochs for faster trials
+    """
+    
+    # Suggest hyperparameters
+    num_frames = trial.suggest_categorical('num_frames', [10, 12, 14, 16, 20])
+    patch_size = trial.suggest_categorical('patch_size', [8, 14, 16])
+    embed_dim = trial.suggest_categorical('embed_dim', [128, 160, 192, 256])
+    spatial_depth = trial.suggest_int('spatial_depth', 1, 4)
+    temporal_depth = trial.suggest_int('temporal_depth', 1, 4)
+    num_heads = trial.suggest_categorical('num_heads', [2, 4, 6, 8])
+    dropout = trial.suggest_categorical('dropout', [0.0, 0.1, 0.2, 0.3, 0.4])
+    batch_size = trial.suggest_categorical('batch_size', [8, 16, 24, 32])
+    lr = trial.suggest_categorical('learning_rate', [1e-3, 3e-3, 5e-3])
+    weight_decay = trial.suggest_categorical('weight_decay', [1e-5, 1e-4, 1e-3])
+    gradient_clip = trial.suggest_categorical('gradient_clip', [0.5, 1.0, 2.0])
+    num_workers = trial.suggest_categorical('num_workers', [2, 4, 6, 8])
+    
+    # Check embed_dim divisibility by num_heads
+    if embed_dim % num_heads != 0:
+        raise optuna.TrialPruned()
+    
+    # Setup device
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     
     try:
-        model = trainer.train()
-        logger.info("\n" + "="*80)
-        logger.info("✓ TRAINING COMPLETED!")
-        logger.info("="*80)
-        logger.info(f"✓ Best validation accuracy: {trainer.best_val_acc*100:.2f}%")
-        logger.info(f"✓ Model saved to: {config['save_dir']}/best_model.pth")
-        logger.info(f"✓ All plots saved to: {config['save_dir']}/plots/")
-        logger.info(f"✓ Metrics CSV saved to: {config['save_dir']}/plots/training_metrics.csv")
-        logger.info("")
+        # Create datasets
+        train_ds = NPZDataset(train_dir, num_frames, 112, True)
+        val_ds = NPZDataset(val_dir, num_frames, 112, False)
         
-        if 85 <= trainer.best_val_acc * 100 <= 90:
-            logger.info("🎯 PERFECT! Achieved 85-90% target range!")
-        elif 80 <= trainer.best_val_acc * 100 < 85:
-            logger.info("✓ CLOSE! Got 80-85%")
-        elif 90 < trainer.best_val_acc * 100 <= 95:
-            logger.info("⚠ SLIGHTLY OVER! Got 90-95%")
-        elif trainer.best_val_acc * 100 > 95:
-            logger.info("❌ TOO HIGH! Got 95%+")
-        else:
-            logger.info("⚠ BELOW TARGET! Got <80%")
+        num_classes = len(train_ds.classes)
         
-        logger.info("="*80)
-        return model
+        train_loader = DataLoader(train_ds, batch_size, shuffle=True,
+                                  num_workers=num_workers, pin_memory=True, drop_last=True)
+        val_loader = DataLoader(val_ds, batch_size, shuffle=False,
+                               num_workers=num_workers, pin_memory=True)
         
+        # Create model
+        model = ViViT(
+            num_classes=num_classes,
+            num_frames=num_frames,
+            img_size=112,
+            patch_size=patch_size,
+            embed_dim=embed_dim,
+            spatial_depth=spatial_depth,
+            temporal_depth=temporal_depth,
+            heads=num_heads,
+            dropout=dropout
+        )
+        
+        if torch.cuda.device_count() > 1:
+            model = nn.DataParallel(model)
+        model = model.to(device)
+        
+        # Optimizer and criterion
+        optimizer = optim.SGD(model.parameters(), lr=lr, momentum=0.9, 
+                             weight_decay=weight_decay, nesterov=True)
+        criterion = nn.CrossEntropyLoss(label_smoothing=0.05)
+        
+        # Training loop (reduced epochs for trials)
+        best_val_acc = 0.0
+        patience_counter = 0
+        patience = 5
+        
+        for epoch in range(n_trials_epochs):
+            train_loss, train_acc = train_epoch(model, train_loader, optimizer, 
+                                               criterion, device, gradient_clip)
+            val_loss, val_acc, val_f1 = evaluate(model, val_loader, criterion, device)
+            
+            logger.info(f"Trial {trial.number} | Epoch {epoch+1}/{n_trials_epochs} | "
+                       f"Train Acc: {train_acc*100:.2f}% | Val Acc: {val_acc*100:.2f}%")
+            
+            if val_acc > best_val_acc:
+                best_val_acc = val_acc
+                patience_counter = 0
+            else:
+                patience_counter += 1
+            
+            # Early stopping for trial
+            if patience_counter >= patience:
+                logger.info(f"Trial {trial.number} early stopped at epoch {epoch+1}")
+                break
+            
+            # Report intermediate value for pruning
+            trial.report(val_acc, epoch)
+            
+            # Handle pruning based on the intermediate value
+            if trial.should_prune():
+                raise optuna.TrialPruned()
+        
+        return best_val_acc
+    
     except Exception as e:
-        logger.error(f"\n✗ Training failed: {e}")
-        raise
+        logger.error(f"Trial {trial.number} failed: {str(e)}")
+        raise optuna.TrialPruned()
 
+# ===== FINAL TRAINING WITH BEST PARAMS =====
+
+def final_training(best_params, train_dir, val_dir, save_dir, full_epochs=50):
+    """Train final model with optimized hyperparameters"""
+    
+    logger.info("\n" + "="*70)
+    logger.info("FINAL TRAINING WITH OPTIMIZED PARAMETERS")
+    logger.info("="*70)
+    
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    save_dir = Path(save_dir)
+    save_dir.mkdir(exist_ok=True)
+    (save_dir / "plots").mkdir(exist_ok=True)
+    
+    # Create datasets
+    train_ds = NPZDataset(train_dir, best_params['num_frames'], 112, True)
+    val_ds = NPZDataset(val_dir, best_params['num_frames'], 112, False)
+    num_classes = len(train_ds.classes)
+    
+    train_loader = DataLoader(train_ds, best_params['batch_size'], shuffle=True,
+                              num_workers=best_params['num_workers'], pin_memory=True, drop_last=True)
+    val_loader = DataLoader(val_ds, best_params['batch_size'], shuffle=False,
+                           num_workers=best_params['num_workers'], pin_memory=True)
+    
+    # Create model
+    model = ViViT(
+        num_classes=num_classes,
+        num_frames=best_params['num_frames'],
+        img_size=112,
+        patch_size=best_params['patch_size'],
+        embed_dim=best_params['embed_dim'],
+        spatial_depth=best_params['spatial_depth'],
+        temporal_depth=best_params['temporal_depth'],
+        heads=best_params['num_heads'],
+        dropout=best_params['dropout']
+    )
+    
+    if torch.cuda.device_count() > 1:
+        logger.info(f"Using {torch.cuda.device_count()} GPUs")
+        model = nn.DataParallel(model)
+    model = model.to(device)
+    
+    # Optimizer and criterion
+    optimizer = optim.SGD(model.parameters(), lr=best_params['learning_rate'],
+                         momentum=0.9, weight_decay=best_params['weight_decay'], nesterov=True)
+    criterion = nn.CrossEntropyLoss(label_smoothing=0.05)
+    
+    # Training history
+    train_losses, val_losses = [], []
+    train_accs, val_accs = [], []
+    best_val_acc = 0.0
+    patience_counter = 0
+    patience = 20
+    
+    # Training loop
+    for epoch in range(full_epochs):
+        logger.info(f"\nEpoch {epoch+1}/{full_epochs}")
+        
+        train_loss, train_acc = train_epoch(model, train_loader, optimizer, 
+                                           criterion, device, best_params['gradient_clip'])
+        val_loss, val_acc, val_f1 = evaluate(model, val_loader, criterion, device)
+        
+        train_losses.append(train_loss)
+        val_losses.append(val_loss)
+        train_accs.append(train_acc)
+        val_accs.append(val_acc)
+        
+        logger.info(f"Train - Loss: {train_loss:.4f}, Acc: {train_acc*100:.2f}%")
+        logger.info(f"Val   - Loss: {val_loss:.4f}, Acc: {val_acc*100:.2f}%, F1: {val_f1:.4f}")
+        
+        if val_acc > best_val_acc:
+            best_val_acc = val_acc
+            
+            state = model.module.state_dict() if isinstance(model, nn.DataParallel) else model.state_dict()
+            torch.save({
+                'model_state_dict': state,
+                'accuracy': best_val_acc,
+                'epoch': epoch,
+                'hyperparameters': best_params
+            }, save_dir / "best_model.pth")
+            
+            logger.info(f"✓ Best model saved! Acc: {best_val_acc*100:.2f}%")
+            patience_counter = 0
+        else:
+            patience_counter += 1
+        
+        if patience_counter >= patience:
+            logger.info(f"Early stopping at epoch {epoch+1}")
+            break
+    
+    # Plot training curves
+    fig, axes = plt.subplots(1, 2, figsize=(14, 5))
+    epochs = list(range(1, len(train_losses) + 1))
+    
+    axes[0].plot(epochs, [a*100 for a in train_accs], 'b-', label='Train', linewidth=2)
+    axes[0].plot(epochs, [a*100 for a in val_accs], 'r-', label='Val', linewidth=2)
+    axes[0].set_title('Accuracy (%)', fontsize=14, fontweight='bold')
+    axes[0].set_xlabel('Epoch')
+    axes[0].set_ylabel('Accuracy (%)')
+    axes[0].legend()
+    axes[0].grid(True, alpha=0.3)
+    
+    axes[1].plot(epochs, train_losses, 'b-', label='Train', linewidth=2)
+    axes[1].plot(epochs, val_losses, 'r-', label='Val', linewidth=2)
+    axes[1].set_title('Loss', fontsize=14, fontweight='bold')
+    axes[1].set_xlabel('Epoch')
+    axes[1].set_ylabel('Loss')
+    axes[1].legend()
+    axes[1].grid(True, alpha=0.3)
+    
+    plt.tight_layout()
+    plt.savefig(save_dir / "plots" / "training_curves.png", dpi=150)
+    plt.close()
+    
+    logger.info("\n" + "="*70)
+    logger.info(f"FINAL TRAINING COMPLETE - Best Val Acc: {best_val_acc*100:.2f}%")
+    logger.info("="*70)
+    
+    return best_val_acc
+
+# ===== MAIN =====
+
+def main():
+    # Configuration
+    TRAIN_DIR = '/kaggle/input/npz-lightweight-videos-without-cropping-dataset/npz_lightweight_videos_without_cropping_splitted_dataset/train'
+    VAL_DIR = '/kaggle/input/npz-lightweight-videos-without-cropping-dataset/npz_lightweight_videos_without_cropping_splitted_dataset/val'
+    SAVE_DIR = '/kaggle/working/'
+    
+    N_TRIALS = 50  # Number of Optuna trials
+    N_TRIALS_EPOCHS = 15  # Epochs per trial (reduced for faster optimization)
+    FULL_EPOCHS = 50  # Full training epochs with best params
+    
+    logger.info("\n" + "="*70)
+    logger.info("ViViT HYPERPARAMETER OPTIMIZATION WITH OPTUNA")
+    logger.info("="*70)
+    logger.info(f"Trials: {N_TRIALS} | Epochs per trial: {N_TRIALS_EPOCHS}")
+    logger.info(f"Full training epochs: {FULL_EPOCHS}")
+    logger.info("="*70 + "\n")
+    
+    # Create Optuna study
+    study = optuna.create_study(
+        direction='maximize',
+        sampler=optuna.samplers.TPESampler(seed=42),
+        pruner=optuna.pruners.MedianPruner(n_startup_trials=5, n_warmup_steps=5)
+    )
+    
+    # Optimize
+    logger.info("Starting Optuna optimization...")
+    study.optimize(
+        lambda trial: objective(trial, TRAIN_DIR, VAL_DIR, N_TRIALS_EPOCHS),
+        n_trials=N_TRIALS,
+        timeout=None,
+        show_progress_bar=True
+    )
+    
+    # Get best parameters
+    logger.info("\n" + "="*70)
+    logger.info("OPTIMIZATION COMPLETE")
+    logger.info("="*70)
+    logger.info(f"Best trial: {study.best_trial.number}")
+    logger.info(f"Best validation accuracy: {study.best_value*100:.2f}%")
+    logger.info("\nBest hyperparameters:")
+    for key, value in study.best_params.items():
+        logger.info(f"  {key}: {value}")
+    
+    # Save optimization results
+    save_dir = Path(SAVE_DIR)
+    with open(save_dir / 'optuna_study.json', 'w') as f:
+        json.dump({
+            'best_params': study.best_params,
+            'best_value': study.best_value,
+            'best_trial': study.best_trial.number,
+            'n_trials': len(study.trials)
+        }, f, indent=4)
+    
+    # Plot optimization history
+    try:
+        fig = optuna.visualization.matplotlib.plot_optimization_history(study)
+        plt.savefig(save_dir / 'plots' / 'optuna_history.png', dpi=150, bbox_inches='tight')
+        plt.close()
+        
+        fig = optuna.visualization.matplotlib.plot_param_importances(study)
+        plt.savefig(save_dir / 'plots' / 'optuna_importances.png', dpi=150, bbox_inches='tight')
+        plt.close()
+    except Exception as e:
+        logger.warning(f"Could not generate Optuna plots: {str(e)}")
+    
+    # Final training with best parameters
+    logger.info("\n" + "="*70)
+    logger.info("STARTING FINAL TRAINING")
+    logger.info("="*70)
+    
+    final_acc = final_training(study.best_params, TRAIN_DIR, VAL_DIR, SAVE_DIR, FULL_EPOCHS)
+    
+    logger.info("\n" + "="*70)
+    logger.info(f"ALL DONE! Final Best Accuracy: {final_acc*100:.2f}%")
+    logger.info("="*70)
 
 if __name__ == "__main__":
     main()

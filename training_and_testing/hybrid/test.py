@@ -561,6 +561,70 @@ class TestingPlotter:
         plt.close()
         logger.info("✓ Summary report saved (400 DPI)")
 
+    def plot_misclassification_heatmap(self, y_true, y_pred, class_names):
+        """Plot heatmap of misclassified samples only (off-diagonal errors)"""
+        cm = confusion_matrix(y_true, y_pred)
+        
+        # Zero out the diagonal (correct predictions) — show only errors
+        misclass_matrix = cm.copy().astype(float)
+        np.fill_diagonal(misclass_matrix, 0)
+        
+        fig_size = max(16, len(class_names) * 0.6)
+        plt.figure(figsize=(fig_size, fig_size * 0.9))
+        
+        # Mask cells with zero errors so they appear blank
+        mask = misclass_matrix == 0
+        
+        sns.heatmap(
+            misclass_matrix,
+            annot=True,
+            fmt='.0f',
+            cmap='YlOrRd',
+            mask=mask,
+            xticklabels=class_names,
+            yticklabels=class_names,
+            linewidths=0.5,
+            linecolor='lightgray',
+            cbar_kws={'label': 'Number of Misclassifications'},
+            annot_kws={'size': 9}
+        )
+        
+        # Overlay blank cells with a neutral color so they're visually distinct
+        sns.heatmap(
+            misclass_matrix,
+            annot=False,
+            cmap=['#f7f7f7'],
+            mask=~mask,
+            xticklabels=class_names,
+            yticklabels=class_names,
+            linewidths=0.5,
+            linecolor='lightgray',
+            cbar=False,
+            alpha=0.4
+        )
+        
+        plt.title('Misclassification Heatmap\n(Diagonal removed — errors only)',
+                fontsize=18, fontweight='bold', pad=20)
+        plt.xlabel('Predicted Label', fontsize=14, fontweight='bold')
+        plt.ylabel('True Label', fontsize=14, fontweight='bold')
+        plt.xticks(rotation=45, ha='right')
+        plt.yticks(rotation=0)
+        
+        # Annotate total errors per row (true class)
+        total_errors_per_class = misclass_matrix.sum(axis=1)
+        for i, total in enumerate(total_errors_per_class):
+            if total > 0:
+                plt.text(
+                    len(class_names) + 0.3, i + 0.5,
+                    f'Σ={int(total)}',
+                    va='center', ha='left',
+                    fontsize=9, color='#c0392b', fontweight='bold'
+                )
+        
+        plt.tight_layout()
+        plt.savefig(self.plot_dir / 'misclassification_heatmap.png', dpi=400, bbox_inches='tight')
+        plt.close()
+        logger.info("✓ Misclassification heatmap saved (400 DPI)")
 
 # -------------------------
 # Model Tester
@@ -689,7 +753,8 @@ class ModelTester:
         logger.info("\nGenerating plots...")
         self.plotter.plot_confusion_matrix(all_labels, all_preds, class_names)
         self.plotter.plot_normalized_confusion_matrix(all_labels, all_preds, class_names)
-        
+        self.plotter.plot_misclassification_heatmap(all_labels, all_preds, class_names)
+
         # Generate PR curves
         logger.info("\nGenerating PR curves...")
         ap_scores, mean_ap = self.plotter.plot_pr_curves_combined(all_labels, all_probs, class_names)
@@ -979,6 +1044,7 @@ def main():
         logger.info("   • plots/roc_curves_individual/*.png (individual ROC curves, 300 DPI)")
         logger.info("   • plots/class_accuracy_comparison.png (sorted accuracy, 400 DPI)")
         logger.info("   • plots/summary_report.png (400 DPI)")
+        logger.info("   • plots/misclassification_heatmap.png (errors only, 400 DPI)")
         
     except Exception as e:
         logger.error(f"\n❌ Testing failed: {e}")
