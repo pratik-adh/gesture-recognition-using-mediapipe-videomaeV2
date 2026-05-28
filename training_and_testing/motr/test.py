@@ -38,7 +38,6 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-
 # -------------------------
 # Dataset (Same as Training)
 # -------------------------
@@ -441,43 +440,108 @@ class TestingPlotter:
         plt.close()
         logger.info("✓ Normalized confusion matrix saved (400 DPI)")
     
-    def plot_pr_curves_combined(self, y_true, y_probs, class_names):
-        """Plot all PR curves on one graph with AP scores - legend in bottom-left"""
-        plt.figure(figsize=(14, 10))
-        
-        colors = plt.cm.tab20(np.linspace(0, 1, len(class_names)))
-        
-        ap_scores = []
-        
-        for i, class_name in enumerate(class_names):
-            y_true_binary = (y_true == i).astype(int)
-            y_scores = y_probs[:, i]
-            
-            precision, recall, _ = precision_recall_curve(y_true_binary, y_scores)
-            ap = average_precision_score(y_true_binary, y_scores)
-            ap_scores.append((class_name, ap))
-            
-            plt.plot(recall, precision, color=colors[i], lw=1.5, alpha=0.8,
-                    label=f'{class_name} (AP={ap:.3f})')
-        
-        plt.xlabel('Recall', fontsize=13, fontweight='bold')
-        plt.ylabel('Precision', fontsize=13, fontweight='bold')
-        plt.title('Precision-Recall Curves - All Classes', fontsize=16, fontweight='bold', pad=15)
-        plt.grid(True, alpha=0.3, linestyle='--')
-        plt.xlim([0.0, 1.0])
-        plt.ylim([0.0, 1.05])
-        
-        plt.legend(loc='lower left', fontsize=8, framealpha=0.9, ncol=2)
-        
+    def plot_misclassification_heatmap(self, y_true, y_pred, class_names):
+        """Plot heatmap of misclassified samples only (off-diagonal errors)"""
+        cm = confusion_matrix(y_true, y_pred)
+
+        # Zero out the diagonal (correct predictions) — show only errors
+        misclass_matrix = cm.copy().astype(float)
+        np.fill_diagonal(misclass_matrix, 0)
+
+        fig_size = max(16, len(class_names) * 0.6)
+        plt.figure(figsize=(fig_size, fig_size * 0.9))
+
+        # Mask cells with zero errors so they appear blank
+        mask = misclass_matrix == 0
+
+        sns.heatmap(
+            misclass_matrix,
+            annot=True,
+            fmt='.0f',
+            cmap='YlOrRd',
+            mask=mask,
+            xticklabels=class_names,
+            yticklabels=class_names,
+            linewidths=0.5,
+            linecolor='lightgray',
+            cbar_kws={'label': 'Number of Misclassifications'},
+            annot_kws={'size': 9}
+        )
+
+        # Overlay blank cells with a neutral color so they're visually distinct
+        sns.heatmap(
+            misclass_matrix,
+            annot=False,
+            cmap=['#f7f7f7'],
+            mask=~mask,
+            xticklabels=class_names,
+            yticklabels=class_names,
+            linewidths=0.5,
+            linecolor='lightgray',
+            cbar=False,
+            alpha=0.4
+        )
+
+        plt.title('Misclassification Heatmap\n(Diagonal removed — errors only)',
+                fontsize=18, fontweight='bold', pad=20)
+        plt.xlabel('Predicted Label', fontsize=14, fontweight='bold')
+        plt.ylabel('True Label', fontsize=14, fontweight='bold')
+        plt.xticks(rotation=45, ha='right')
+        plt.yticks(rotation=0)
+
+        # Annotate total errors per row (true class)
+        total_errors_per_class = misclass_matrix.sum(axis=1)
+        for i, total in enumerate(total_errors_per_class):
+            if total > 0:
+                plt.text(
+                    len(class_names) + 0.3, i + 0.5,
+                    f'Σ={int(total)}',
+                    va='center', ha='left',
+                    fontsize=9, color='#c0392b', fontweight='bold'
+                )
+
         plt.tight_layout()
-        plt.savefig(self.plot_dir / 'pr_curves_combined.png', dpi=400, bbox_inches='tight')
+        plt.savefig(self.plot_dir / 'misclassification_heatmap.png', dpi=400, bbox_inches='tight')
         plt.close()
-        logger.info("✓ Combined PR curves saved (400 DPI)")
-        
-        mean_ap = np.mean([ap for _, ap in ap_scores])
-        logger.info(f"  Mean Average Precision (mAP): {mean_ap:.4f}")
-        
-        return ap_scores, mean_ap
+        logger.info("✓ Misclassification heatmap saved (400 DPI)")
+    
+    def plot_pr_curves_combined(self, y_true, y_probs, class_names):
+            """Plot all PR curves on one graph with AP scores - legend in bottom-left"""
+            plt.figure(figsize=(14, 10))
+            
+            colors = plt.cm.tab20(np.linspace(0, 1, len(class_names)))
+            
+            ap_scores = []
+            
+            for i, class_name in enumerate(class_names):
+                y_true_binary = (y_true == i).astype(int)
+                y_scores = y_probs[:, i]
+                
+                precision, recall, _ = precision_recall_curve(y_true_binary, y_scores)
+                ap = average_precision_score(y_true_binary, y_scores)
+                ap_scores.append((class_name, ap))
+                
+                plt.plot(recall, precision, color=colors[i], lw=1.5, alpha=0.8,
+                        label=f'{class_name} (AP={ap:.3f})')
+            
+            plt.xlabel('Recall', fontsize=13, fontweight='bold')
+            plt.ylabel('Precision', fontsize=13, fontweight='bold')
+            plt.title('Precision-Recall Curves - All Classes', fontsize=16, fontweight='bold', pad=15)
+            plt.grid(True, alpha=0.3, linestyle='--')
+            plt.xlim([0.0, 1.0])
+            plt.ylim([0.0, 1.05])
+            
+            plt.legend(loc='lower left', fontsize=8, framealpha=0.9, ncol=2)
+            
+            plt.tight_layout()
+            plt.savefig(self.plot_dir / 'pr_curves_combined.png', dpi=400, bbox_inches='tight')
+            plt.close()
+            logger.info("✓ Combined PR curves saved (400 DPI)")
+            
+            mean_ap = np.mean([ap for _, ap in ap_scores])
+            logger.info(f"  Mean Average Precision (mAP): {mean_ap:.4f}")
+            
+            return ap_scores, mean_ap
     
     def plot_pr_curves_individual(self, y_true, y_probs, class_names):
         """Plot individual PR curves for each class"""
@@ -784,6 +848,399 @@ class TestingPlotter:
         logger.info("✓ Summary report saved (400 DPI)")
 
 
+class FPFNAnalyzer:
+    """
+    Per-class False Positive / False Negative error analysis.
+
+    For each class i:
+      FP = samples predicted as i but whose true label != i
+      FN = samples whose true label is i but predicted != i
+
+    Outputs (all saved to plots/fp_fn_analysis/):
+      - fp_fn_summary.csv
+      - fp_fn_rates.png
+      - fp_fn_confidence_dist.png
+      - fp_fn_confusion_pairs.png
+      - fp_fn_threshold_sweep.png
+      - fp_confusion_matrix.png / _normalized.png
+      - fn_confusion_matrix.png / _normalized.png
+      - fp_fn_high_conf_errors.csv  (saved to results_dir)
+    """
+
+    def __init__(self, results_dir: Path, plot_dir: Path):
+        self.results_dir = results_dir
+        self.plot_dir    = plot_dir
+        self.error_dir   = plot_dir / 'fp_fn_analysis'
+        self.error_dir.mkdir(parents=True, exist_ok=True)
+        logger.info(f"📂 FP/FN analysis outputs → {self.error_dir}")
+
+    # ------------------------------------------------------------------
+    # Public entry point
+    # ------------------------------------------------------------------
+    def analyze(self, y_true, y_pred, y_probs, class_names, filenames):
+        """Run all FP/FN analyses. Called from ModelTester.test()."""
+        y_true  = np.array(y_true)
+        y_pred  = np.array(y_pred)
+        y_probs = np.array(y_probs)
+
+        summary_rows = []
+        for cls_idx, cls_name in enumerate(class_names):
+            fp_mask, fn_mask = self._masks(y_true, y_pred, cls_idx)
+            n_positive  = int((y_true == cls_idx).sum())
+            n_predicted = int((y_pred == cls_idx).sum())
+            n_fp        = int(fp_mask.sum())
+            n_fn        = int(fn_mask.sum())
+            fp_rate     = n_fp / max(n_predicted, 1)
+            fn_rate     = n_fn / max(n_positive,  1)
+            summary_rows.append({
+                'class':       cls_name,
+                'n_true':      n_positive,
+                'n_predicted': n_predicted,
+                'n_fp':        n_fp,
+                'n_fn':        n_fn,
+                'fp_rate':     round(fp_rate, 4),
+                'fn_rate':     round(fn_rate, 4),
+                'precision':   round(1 - fp_rate, 4),
+                'recall':      round(1 - fn_rate,  4),
+            })
+
+        summary_df = pd.DataFrame(summary_rows)
+        summary_df.to_csv(self.results_dir / 'fp_fn_summary.csv', index=False)
+        logger.info("✓ fp_fn_summary.csv saved")
+
+        self._plot_fp_fn_rates(summary_df)
+        self._plot_confidence_distributions(y_true, y_pred, y_probs, class_names)
+        self._plot_confusion_pairs(y_true, y_pred, class_names)
+        self._plot_threshold_sweep(y_true, y_probs, class_names)
+        self.plot_fp_confusion_matrix(y_true, y_pred, class_names)
+        self.plot_fn_confusion_matrix(y_true, y_pred, class_names)
+        self._save_high_conf_errors(y_true, y_pred, y_probs, class_names, filenames)
+
+        logger.info("✅ FP/FN analysis complete")
+        return summary_df
+
+    # ------------------------------------------------------------------
+    # Helpers
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _masks(y_true, y_pred, cls_idx):
+        fp_mask = (y_pred == cls_idx) & (y_true != cls_idx)
+        fn_mask = (y_true == cls_idx) & (y_pred != cls_idx)
+        return fp_mask, fn_mask
+
+    # ------------------------------------------------------------------
+    # Plot 1 – per-class FP/FN rate bar chart
+    # ------------------------------------------------------------------
+    def _plot_fp_fn_rates(self, summary_df):
+        fig, axes = plt.subplots(1, 2, figsize=(18, max(6, len(summary_df) * 0.35)))
+
+        for ax, col, color, title in [
+            (axes[0], 'fp_rate', '#e74c3c',
+             'False Positive Rate\n(FP / predicted positives)'),
+            (axes[1], 'fn_rate', '#e67e22',
+             'False Negative Rate\n(FN / true positives  =  1 − recall)'),
+        ]:
+            sdf  = summary_df.sort_values(col, ascending=True)
+            bars = ax.barh(sdf['class'], sdf[col], color=color, alpha=0.80)
+            ax.set_xlim([0, 1.05])
+            ax.axvline(x=summary_df[col].mean(), color='navy', linestyle='--',
+                       linewidth=1.5, label=f'Mean: {summary_df[col].mean():.3f}')
+            ax.set_title(title, fontsize=13, fontweight='bold')
+            ax.set_xlabel('Rate', fontsize=11)
+            ax.grid(True, axis='x', alpha=0.3, linestyle='--')
+            ax.legend(fontsize=10)
+            for bar, val in zip(bars, sdf[col]):
+                ax.text(val + 0.01, bar.get_y() + bar.get_height() / 2,
+                        f'{val:.3f}', va='center', fontsize=8)
+
+        plt.tight_layout()
+        plt.savefig(self.error_dir / 'fp_fn_rates.png', dpi=400, bbox_inches='tight')
+        plt.close()
+        logger.info("✓ fp_fn_rates.png saved (400 DPI)")
+
+    # ------------------------------------------------------------------
+    # Plot 2 – confidence distribution of FP vs FN vs correct
+    # ------------------------------------------------------------------
+    def _plot_confidence_distributions(self, y_true, y_pred, y_probs, class_names):
+        n_classes = len(class_names)
+        ncols = 4
+        nrows = (n_classes + ncols - 1) // ncols
+        fig, axes = plt.subplots(nrows, ncols,
+                                  figsize=(ncols * 4, nrows * 3.2), squeeze=False)
+
+        bins = np.linspace(0, 1, 21)
+        for cls_idx, cls_name in enumerate(class_names):
+            ax = axes[cls_idx // ncols][cls_idx % ncols]
+            fp_mask, fn_mask = self._masks(y_true, y_pred, cls_idx)
+            correct_mask     = (y_true == cls_idx) & (y_pred == cls_idx)
+
+            fp_conf = y_probs[fp_mask, cls_idx]
+            fn_conf = y_probs[fn_mask].max(axis=1)
+            ok_conf = y_probs[correct_mask, cls_idx]
+
+            ax.hist(ok_conf, bins=bins, alpha=0.55, color='#2ecc71',
+                    label=f'Correct ({len(ok_conf)})')
+            ax.hist(fp_conf, bins=bins, alpha=0.65, color='#e74c3c',
+                    label=f'FP ({len(fp_conf)})')
+            ax.hist(fn_conf, bins=bins, alpha=0.65, color='#e67e22',
+                    label=f'FN ({len(fn_conf)})')
+            ax.set_title(cls_name, fontsize=10, fontweight='bold')
+            ax.set_xlim([0, 1])
+            ax.set_xlabel('Confidence', fontsize=8)
+            ax.legend(fontsize=7, loc='upper left')
+            ax.grid(True, alpha=0.3)
+
+        for idx in range(n_classes, nrows * ncols):
+            axes[idx // ncols][idx % ncols].set_visible(False)
+
+        plt.suptitle('Confidence Distributions: Correct vs FP vs FN per Class',
+                     fontsize=14, fontweight='bold', y=1.01)
+        plt.tight_layout()
+        plt.savefig(self.error_dir / 'fp_fn_confidence_dist.png',
+                    dpi=300, bbox_inches='tight')
+        plt.close()
+        logger.info("✓ fp_fn_confidence_dist.png saved (300 DPI)")
+
+    # ------------------------------------------------------------------
+    # Plot 3 – confusion pairs (FP sources / FN destinations)
+    # ------------------------------------------------------------------
+    def _plot_confusion_pairs(self, y_true, y_pred, class_names, top_n=6):
+        from collections import Counter
+        n_classes = len(class_names)
+        fig, axes = plt.subplots(n_classes, 2,
+                                  figsize=(14, max(n_classes * 2.2, 8)))
+        if n_classes == 1:
+            axes = np.array([axes])
+
+        for cls_idx, cls_name in enumerate(class_names):
+            fp_mask, fn_mask = self._masks(y_true, y_pred, cls_idx)
+            fp_true_labels   = y_true[fp_mask]
+            fn_pred_labels   = y_pred[fn_mask]
+
+            ax_fp = axes[cls_idx][0]
+            ax_fn = axes[cls_idx][1]
+
+            if len(fp_true_labels):
+                fp_top   = sorted(Counter(fp_true_labels).items(), key=lambda x: -x[1])[:top_n]
+                fp_names = [class_names[i] for i, _ in fp_top]
+                fp_vals  = [v for _, v in fp_top]
+                ax_fp.barh(fp_names, fp_vals, color='#e74c3c', alpha=0.8)
+            ax_fp.set_title(f'{cls_name} – FP sources', fontsize=9, fontweight='bold')
+            ax_fp.set_xlabel('Count', fontsize=8)
+            ax_fp.grid(True, axis='x', alpha=0.3)
+
+            if len(fn_pred_labels):
+                fn_top   = sorted(Counter(fn_pred_labels).items(), key=lambda x: -x[1])[:top_n]
+                fn_names = [class_names[i] for i, _ in fn_top]
+                fn_vals  = [v for _, v in fn_top]
+                ax_fn.barh(fn_names, fn_vals, color='#e67e22', alpha=0.8)
+            ax_fn.set_title(f'{cls_name} – FN destinations', fontsize=9, fontweight='bold')
+            ax_fn.set_xlabel('Count', fontsize=8)
+            ax_fn.grid(True, axis='x', alpha=0.3)
+
+        plt.suptitle('FP Sources and FN Destinations per Class',
+                     fontsize=14, fontweight='bold', y=1.005)
+        plt.tight_layout()
+        plt.savefig(self.error_dir / 'fp_fn_confusion_pairs.png',
+                    dpi=300, bbox_inches='tight')
+        plt.close()
+        logger.info("✓ fp_fn_confusion_pairs.png saved (300 DPI)")
+
+    # ------------------------------------------------------------------
+    # Plot 4 – threshold sweep: FP-rate vs FN-rate trade-off
+    # ------------------------------------------------------------------
+    def _plot_threshold_sweep(self, y_true, y_probs, class_names):
+        thresholds = np.linspace(0.01, 0.99, 99)
+        n_classes  = len(class_names)
+        ncols = 4
+        nrows = (n_classes + ncols - 1) // ncols
+        fig, axes = plt.subplots(nrows, ncols,
+                                  figsize=(ncols * 4, nrows * 3.2), squeeze=False)
+
+        for cls_idx, cls_name in enumerate(class_names):
+            ax          = axes[cls_idx // ncols][cls_idx % ncols]
+            scores      = y_probs[:, cls_idx]
+            binary_true = (y_true == cls_idx).astype(int)
+            fp_rates, fn_rates = [], []
+
+            for t in thresholds:
+                predicted = (scores >= t).astype(int)
+                tp = int(((predicted == 1) & (binary_true == 1)).sum())
+                fp = int(((predicted == 1) & (binary_true == 0)).sum())
+                fn = int(((predicted == 0) & (binary_true == 1)).sum())
+                tn = int(((predicted == 0) & (binary_true == 0)).sum())
+                fp_rates.append(fp / max(fp + tn, 1))
+                fn_rates.append(fn / max(tp + fn, 1))
+
+            ax.plot(thresholds, fp_rates, color='#e74c3c', lw=2, label='FP rate')
+            ax.plot(thresholds, fn_rates, color='#e67e22', lw=2, label='FN rate')
+
+            cross_idx = np.argmin(np.abs(np.array(fp_rates) - np.array(fn_rates)))
+            ax.axvline(thresholds[cross_idx], color='navy', linestyle='--',
+                       linewidth=1, label=f'Cross @ {thresholds[cross_idx]:.2f}')
+
+            ax.set_title(cls_name, fontsize=10, fontweight='bold')
+            ax.set_xlabel('Threshold', fontsize=8)
+            ax.set_ylabel('Rate',      fontsize=8)
+            ax.set_xlim([0, 1])
+            ax.set_ylim([0, 1.05])
+            ax.legend(fontsize=7)
+            ax.grid(True, alpha=0.3)
+
+        for idx in range(n_classes, nrows * ncols):
+            axes[idx // ncols][idx % ncols].set_visible(False)
+
+        plt.suptitle('Threshold Sweep: FP Rate vs FN Rate per Class\n'
+                     '(dashed = equal-error threshold)',
+                     fontsize=14, fontweight='bold', y=1.01)
+        plt.tight_layout()
+        plt.savefig(self.error_dir / 'fp_fn_threshold_sweep.png',
+                    dpi=300, bbox_inches='tight')
+        plt.close()
+        logger.info("✓ fp_fn_threshold_sweep.png saved (300 DPI)")
+
+    # ------------------------------------------------------------------
+    # Plot 5 – FP confusion matrix (Reds) — counts + normalised
+    # ------------------------------------------------------------------
+    def plot_fp_confusion_matrix(self, y_true, y_pred, class_names):
+        cm        = confusion_matrix(y_true, y_pred)
+        fp_matrix = cm.copy().astype(float)
+        np.fill_diagonal(fp_matrix, 0)
+        fig_size  = max(16, len(class_names) * 0.6)
+
+        # Counts
+        plt.figure(figsize=(fig_size, fig_size * 0.9))
+        mask = fp_matrix == 0
+        sns.heatmap(fp_matrix, annot=True, fmt='.0f', cmap='Reds', mask=mask,
+                    xticklabels=class_names, yticklabels=class_names,
+                    linewidths=0.5, linecolor='lightgray',
+                    cbar_kws={'label': 'FP count'}, annot_kws={'size': 9})
+        sns.heatmap(fp_matrix, annot=False, cmap=['#f7f7f7'], mask=~mask,
+                    xticklabels=class_names, yticklabels=class_names,
+                    linewidths=0.5, linecolor='lightgray', cbar=False, alpha=0.4)
+        plt.title('False Positive Matrix (counts)\n'
+                  'Column = predicted class  |  Row = true class  |  Diagonal removed',
+                  fontsize=16, fontweight='bold', pad=20)
+        plt.xlabel('Predicted Label', fontsize=14, fontweight='bold')
+        plt.ylabel('True Label',      fontsize=14, fontweight='bold')
+        plt.xticks(rotation=45, ha='right')
+        plt.yticks(rotation=0)
+        plt.tight_layout()
+        plt.savefig(self.error_dir / 'fp_confusion_matrix.png', dpi=400, bbox_inches='tight')
+        plt.close()
+        logger.info("✓ fp_confusion_matrix.png saved (400 DPI)")
+
+        # Normalised
+        row_sums  = cm.sum(axis=1, keepdims=True)
+        fp_norm   = np.where(row_sums > 0, fp_matrix / row_sums, 0)
+        np.fill_diagonal(fp_norm, 0)
+        mask_norm = fp_norm == 0
+
+        plt.figure(figsize=(fig_size, fig_size * 0.9))
+        sns.heatmap(fp_norm, annot=True, fmt='.2%', cmap='Reds', mask=mask_norm,
+                    xticklabels=class_names, yticklabels=class_names,
+                    vmin=0, vmax=1, linewidths=0.5, linecolor='lightgray',
+                    cbar_kws={'label': 'FP rate (% of true class)'}, annot_kws={'size': 9})
+        sns.heatmap(fp_norm, annot=False, cmap=['#f7f7f7'], mask=~mask_norm,
+                    xticklabels=class_names, yticklabels=class_names,
+                    linewidths=0.5, linecolor='lightgray', cbar=False, alpha=0.4)
+        plt.title('False Positive Matrix (normalised %)\n'
+                  'Column = predicted class  |  Row = true class  |  Diagonal removed',
+                  fontsize=16, fontweight='bold', pad=20)
+        plt.xlabel('Predicted Label', fontsize=14, fontweight='bold')
+        plt.ylabel('True Label',      fontsize=14, fontweight='bold')
+        plt.xticks(rotation=45, ha='right')
+        plt.yticks(rotation=0)
+        plt.tight_layout()
+        plt.savefig(self.error_dir / 'fp_confusion_matrix_normalized.png',
+                    dpi=400, bbox_inches='tight')
+        plt.close()
+        logger.info("✓ fp_confusion_matrix_normalized.png saved (400 DPI)")
+
+    # ------------------------------------------------------------------
+    # Plot 6 – FN confusion matrix (Oranges) — counts + normalised
+    # ------------------------------------------------------------------
+    def plot_fn_confusion_matrix(self, y_true, y_pred, class_names):
+        cm        = confusion_matrix(y_true, y_pred)
+        fn_matrix = cm.copy().astype(float)
+        np.fill_diagonal(fn_matrix, 0)
+        fig_size  = max(16, len(class_names) * 0.6)
+
+        # Counts
+        plt.figure(figsize=(fig_size, fig_size * 0.9))
+        mask = fn_matrix == 0
+        sns.heatmap(fn_matrix, annot=True, fmt='.0f', cmap='Oranges', mask=mask,
+                    xticklabels=class_names, yticklabels=class_names,
+                    linewidths=0.5, linecolor='lightgray',
+                    cbar_kws={'label': 'FN count'}, annot_kws={'size': 9})
+        sns.heatmap(fn_matrix, annot=False, cmap=['#f7f7f7'], mask=~mask,
+                    xticklabels=class_names, yticklabels=class_names,
+                    linewidths=0.5, linecolor='lightgray', cbar=False, alpha=0.4)
+        plt.title('False Negative Matrix (counts)\n'
+                  'Row = true class  |  Column = predicted class  |  Diagonal removed',
+                  fontsize=16, fontweight='bold', pad=20)
+        plt.xlabel('Predicted Label', fontsize=14, fontweight='bold')
+        plt.ylabel('True Label',      fontsize=14, fontweight='bold')
+        plt.xticks(rotation=45, ha='right')
+        plt.yticks(rotation=0)
+        plt.tight_layout()
+        plt.savefig(self.error_dir / 'fn_confusion_matrix.png', dpi=400, bbox_inches='tight')
+        plt.close()
+        logger.info("✓ fn_confusion_matrix.png saved (400 DPI)")
+
+        # Normalised
+        row_sums  = cm.sum(axis=1, keepdims=True)
+        fn_norm   = np.where(row_sums > 0, fn_matrix / row_sums, 0)
+        np.fill_diagonal(fn_norm, 0)
+        mask_norm = fn_norm == 0
+
+        plt.figure(figsize=(fig_size, fig_size * 0.9))
+        sns.heatmap(fn_norm, annot=True, fmt='.2%', cmap='Oranges', mask=mask_norm,
+                    xticklabels=class_names, yticklabels=class_names,
+                    vmin=0, vmax=1, linewidths=0.5, linecolor='lightgray',
+                    cbar_kws={'label': 'FN rate (% of true class)'}, annot_kws={'size': 9})
+        sns.heatmap(fn_norm, annot=False, cmap=['#f7f7f7'], mask=~mask_norm,
+                    xticklabels=class_names, yticklabels=class_names,
+                    linewidths=0.5, linecolor='lightgray', cbar=False, alpha=0.4)
+        plt.title('False Negative Matrix (normalised %)\n'
+                  'Row = true class  |  Column = predicted class  |  Diagonal removed',
+                  fontsize=16, fontweight='bold', pad=20)
+        plt.xlabel('Predicted Label', fontsize=14, fontweight='bold')
+        plt.ylabel('True Label',      fontsize=14, fontweight='bold')
+        plt.xticks(rotation=45, ha='right')
+        plt.yticks(rotation=0)
+        plt.tight_layout()
+        plt.savefig(self.error_dir / 'fn_confusion_matrix_normalized.png',
+                    dpi=400, bbox_inches='tight')
+        plt.close()
+        logger.info("✓ fn_confusion_matrix_normalized.png saved (400 DPI)")
+
+    # ------------------------------------------------------------------
+    # CSV – high-confidence errors
+    # ------------------------------------------------------------------
+    def _save_high_conf_errors(self, y_true, y_pred, y_probs, class_names,
+                                filenames, top_n=50):
+        error_mask        = y_true != y_pred
+        error_conf        = y_probs[error_mask].max(axis=1)
+        error_true        = y_true[error_mask]
+        error_pred        = y_pred[error_mask]
+        error_files       = np.array(filenames)[error_mask]
+        true_class_scores = y_probs[error_mask][
+            np.arange(error_mask.sum()), error_true
+        ]
+        df = pd.DataFrame({
+            'filename':         error_files,
+            'true_class':       [class_names[i] for i in error_true],
+            'predicted_class':  [class_names[i] for i in error_pred],
+            'pred_confidence':  error_conf.round(4),
+            'true_class_score': true_class_scores.round(4),
+            'fp_for_class':     [class_names[p] for p in error_pred],
+            'fn_for_class':     [class_names[t] for t in error_true],
+        })
+        df = df.sort_values('pred_confidence', ascending=False).head(top_n)
+        df.to_csv(self.results_dir / 'fp_fn_high_conf_errors.csv', index=False)
+        logger.info(f"✓ fp_fn_high_conf_errors.csv saved ({len(df)} rows)")
+
 # -------------------------
 # Model Tester
 # -------------------------
@@ -801,7 +1258,7 @@ class ModelTester:
             logger.info("Using CPU")
         
         # Create results directory
-        self.results_dir = Path('./../../output/motr_output_25')
+        self.results_dir = Path('./../../output/motr')
         self.results_dir.mkdir(parents=True, exist_ok=True)
         
         self.plot_dir = self.results_dir / 'plots'
@@ -901,6 +1358,7 @@ class ModelTester:
         logger.info("\nGenerating plots...")
         self.plotter.plot_confusion_matrix(all_labels, all_preds, class_names)
         self.plotter.plot_normalized_confusion_matrix(all_labels, all_preds, class_names)
+        self.plotter.plot_misclassification_heatmap(all_labels, all_preds, class_names)  # ← add this
         
         # Generate PR curves
         logger.info("\nGenerating PR curves...")
@@ -955,6 +1413,14 @@ class ModelTester:
         
         # Save detailed results
         self.save_results(metrics, class_names, all_labels, all_preds, all_probs, all_filenames)
+
+        # ── FP / FN error analysis ──────────────────────────────────────
+        analyzer     = FPFNAnalyzer(self.results_dir, self.plot_dir)
+        fpfn_summary = analyzer.analyze(
+            all_labels, all_preds, all_probs, class_names, all_filenames
+        )
+        logger.info("\nFP/FN rates per class (sorted by FP rate):")
+        logger.info(fpfn_summary.sort_values('fp_rate', ascending=False).to_string(index=False))
         
         # Print summary
         self.print_summary(metrics)
@@ -1170,27 +1636,41 @@ def main():
         # Run testing
         metrics = tester.test()
         
-        # Success message
         logger.info("\n✅ Testing completed successfully!")
         logger.info(f"📁 Results saved to: {tester.results_dir}")
         logger.info("\n📊 Generated files:")
-        logger.info("   • metrics.json - Numerical metrics (including mAP & mAUC)")
-        logger.info("   • classification_report.txt - Detailed per-class metrics")
-        logger.info("   • detailed_predictions.csv - Per-sample predictions")
-        logger.info("   • misclassified_samples.csv - Incorrectly classified samples")
-        logger.info("   • confusion_matrix.csv - Confusion matrix data")
-        logger.info("   • average_precision_scores.csv - AP scores per class")
-        logger.info("   • auc_scores.csv - AUC scores per class")
-        logger.info("   • plots/confusion_matrix.png (counts only, 400 DPI)")
-        logger.info("   • plots/confusion_matrix_normalized.png (percentages, 400 DPI)")
-        logger.info("   • plots/per_class_metrics.png (400 DPI)")
-        logger.info("   • plots/top_k_accuracy.png (400 DPI)")
-        logger.info("   • plots/pr_curves_combined.png (all classes, 400 DPI)")
-        logger.info("   • plots/pr_curves_individual/*.png (36 individual PR curves, 300 DPI)")
-        logger.info("   • plots/roc_curves_combined.png (all classes, 400 DPI)")
-        logger.info("   • plots/roc_curves_individual/*.png (36 individual ROC curves, 300 DPI)")
-        logger.info("   • plots/class_accuracy_comparison.png (sorted accuracy, 400 DPI)")
-        logger.info("   • plots/summary_report.png (400 DPI)")
+        for f in [
+            "metrics.json",
+            "classification_report.txt",
+            "detailed_predictions.csv",
+            "misclassified_samples.csv",
+            "confusion_matrix.csv",
+            "average_precision_scores.csv",
+            "auc_scores.csv",
+            "fp_fn_summary.csv",
+            "fp_fn_high_conf_errors.csv",
+            "plots/confusion_matrix.png (400 DPI)",
+            "plots/confusion_matrix_normalized.png (400 DPI)",
+            "plots/misclassification_heatmap.png (400 DPI)",
+            "plots/per_class_metrics.png (400 DPI)",
+            "plots/top_k_accuracy.png (400 DPI)",
+            "plots/pr_curves_combined.png (400 DPI)",
+            "plots/pr_curves_individual/*.png (300 DPI)",
+            "plots/roc_curves_combined.png (400 DPI)",
+            "plots/roc_curves_individual/*.png (300 DPI)",
+            "plots/class_accuracy_comparison.png (400 DPI)",
+            "plots/summary_report.png (400 DPI)",
+            "plots/fp_fn_analysis/fp_fn_rates.png (400 DPI)",
+            "plots/fp_fn_analysis/fp_fn_confidence_dist.png (300 DPI)",
+            "plots/fp_fn_analysis/fp_fn_confusion_pairs.png (300 DPI)",
+            "plots/fp_fn_analysis/fp_fn_threshold_sweep.png (300 DPI)",
+            "plots/fp_fn_analysis/fp_confusion_matrix.png (400 DPI)",
+            "plots/fp_fn_analysis/fp_confusion_matrix_normalized.png (400 DPI)",
+            "plots/fp_fn_analysis/fn_confusion_matrix.png (400 DPI)",
+            "plots/fp_fn_analysis/fn_confusion_matrix_normalized.png (400 DPI)",
+        ]:
+        
+            logger.info(f"   • {f}")
         
     except Exception as e:
         logger.error(f"\n❌ Testing failed: {e}")

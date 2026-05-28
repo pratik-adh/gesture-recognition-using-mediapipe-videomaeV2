@@ -1,206 +1,201 @@
 #!/usr/bin/env python3
 """
-ViViT Testing Code for Mac - With PR Curves
-Tests the trained model on test/validation set and generates comprehensive metrics including PR curves
+test_vivit_mac.py
+=================
+Comprehensive test script for ConstrainedViViT trained in vivit_plateau_85.py.
+
+Architecture is a byte-for-byte copy of the training file so checkpoint
+weights always load cleanly. Config (embed_dim, num_frames, mlp_ratio, etc.)
+is auto-detected from checkpoint tensor shapes — no manual editing needed.
+
+Checkpoint format (from training code):
+    {
+        'model_state_dict': OrderedDict,
+        'accuracy':         float,
+        'epoch':            int,
+        'class_names':      list[str],
+    }
+
+Outputs
+───────
+<OUT_DIR>/
+  plots/
+    confusion_matrix_counts.png
+    confusion_matrix_normalised.png
+    per_class_metrics.png
+    class_accuracy_sorted.png
+    top_k_accuracy.png
+    pr_curves_combined.png
+    roc_curves_combined.png
+    pr_curves_individual/pr_<CLASS>.png    (P/R curve + P/R/F1 vs threshold)
+    roc_curves_individual/roc_<CLASS>.png  (ROC curve + TPR/FPR/Youden's J)
+    calibration_and_confidence.png
+    summary_report.png
+  metrics/
+    metrics.json
+    classification_report.txt
+    confusion_matrix.csv
+    average_precision_scores.csv
+    auc_scores.csv
+    detailed_predictions.csv
+    misclassified_samples.csv
 """
 
-import os
-import cv2
+import json, warnings, logging
+from datetime import datetime
+from pathlib import Path
+
 import numpy as np
+import pandas as pd
 import torch
 import torch.nn as nn
 from torch.utils.data import Dataset, DataLoader
+from torchvision import transforms
+from PIL import Image
+from tqdm import tqdm
+import matplotlib
+matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 import seaborn as sns
-from tqdm import tqdm
-import warnings
-import pandas as pd
-from pathlib import Path
-import logging
-from datetime import datetime
-from sklearn.metrics import (confusion_matrix, classification_report, accuracy_score, 
-                            f1_score, precision_score, recall_score, 
-                            precision_recall_curve, average_precision_score)
-import json
+
+from sklearn.metrics import (
+    confusion_matrix, classification_report,
+    accuracy_score, f1_score, precision_score, recall_score,
+    precision_recall_curve, average_precision_score,
+    roc_curve, auc,
+    top_k_accuracy_score,
+    balanced_accuracy_score,
+)
+from sklearn.calibration import calibration_curve
 
 warnings.filterwarnings('ignore')
-
-# Set seaborn style for better plots
-sns.set_style("whitegrid")
-plt.rcParams['figure.figsize'] = (12, 8)
-plt.rcParams['font.size'] = 10
-
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(levelname)s - %(message)s',
-    handlers=[logging.StreamHandler(), logging.FileHandler('testing_results.log', mode='a')]
+    handlers=[
+        logging.StreamHandler(),
+        logging.FileHandler('test_vivit_mac.log', mode='a'),
+    ]
 )
-logger = logging.getLogger(__name__)
+log = logging.getLogger(__name__)
 
 
-# -------------------------
-# Dataset (Same as Training)
-# -------------------------
-class NPZDirectoryDataset(Dataset):
-    def __init__(self, root_dir, num_frames=8, img_size=96):
-        self.root_dir = Path(root_dir)
+# ═══════════════════════════════════════════════════════════════
+# PATHS — update before running
+# ═══════════════════════════════════════════════════════════════
+MODEL_PATH = './../../kaggle/training_output_vivit/best_model.pth'
+TEST_DIR   = './../../videos_directory/npz_lightweight_videos_without_cropping_splitted_dataset/test'
+OUT_DIR    = './../../output/vivit/new'
+# ═══════════════════════════════════════════════════════════════
+
+
+# ─────────────────────────────────────────────────────────────
+# Dataset  (matches training code — no augmentation)
+# ─────────────────────────────────────────────────────────────
+class NPZDataset(Dataset):
+    def __init__(self, root_dir, class_names=None, num_frames=16, img_size=112):
+        self.root_dir   = Path(root_dir)
         self.num_frames = num_frames
-        self.img_size = img_size
+        self.img_size   = img_size
+        self.classes    = class_names if class_names is not None else \
+                          sorted(d.name for d in self.root_dir.iterdir() if d.is_dir())
+        self.label2id   = {c: i for i, c in enumerate(self.classes)}
+        self.samples    = []
+        self._scan()
+        # Identical to training is_training=False branch
+        self.transform = transforms.Compose([
+            transforms.Resize((img_size, img_size)),
+            transforms.ToTensor(),
+            transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225]),
+        ])
 
-        self.samples = []
-        self.class_to_idx = {}
-        self.classes = []
-        self._scan_directory()
-
-        logger.info(f"Dataset: {root_dir}")
-        logger.info(f"Classes: {len(self.classes)}, Samples: {len(self.samples)}")
-
-    def _scan_directory(self):
-        if not self.root_dir.exists():
-            raise FileNotFoundError(f"{self.root_dir} does not exist")
-        
-        class_dirs = sorted([d for d in self.root_dir.iterdir() if d.is_dir()])
-        for cid, d in enumerate(class_dirs):
-            self.classes.append(d.name)
-            self.class_to_idx[d.name] = cid
-            files = list(d.glob("*.npz"))
+    def _scan(self):
+        for c in self.classes:
+            d = self.root_dir / c
+            if not d.exists():
+                continue
+            files = sorted(d.glob('*.npz'))
             for f in files:
-                self.samples.append({'path': f, 'class_idx': cid, 'class_name': d.name})
-            logger.info(f"  {d.name}: {len(files)} videos")
+                self.samples.append((f, self.label2id[c], c))
+            log.info(f"  {c}: {len(files)} videos")
+        log.info(f"Dataset : {self.root_dir}")
+        log.info(f"Classes : {len(self.classes)},  Samples : {len(self.samples)}")
 
     def __len__(self):
         return len(self.samples)
 
-    def load_video(self, npz_path):
+    def _load_video(self, path):
         try:
-            data = np.load(npz_path)
-            if 'frames' in data:
-                frames = data['frames']
-            elif 'video' in data:
-                frames = data['video']
-            else:
-                frames = data[data.files[0]]
-
+            data   = np.load(path)
+            frames = data['frames'] if 'frames' in data else data[data.files[0]]
             if frames.dtype != np.uint8:
-                if frames.max() <= 1.0:
-                    frames = (frames * 255).astype(np.uint8)
-                else:
-                    frames = np.clip(frames, 0, 255).astype(np.uint8)
+                frames = (frames * 255).astype(np.uint8) if frames.max() <= 1.0 \
+                         else np.clip(frames, 0, 255).astype(np.uint8)
             return frames
         except Exception as e:
-            logger.error(f"Error loading {npz_path}: {e}")
-            return np.zeros((self.num_frames, self.img_size, self.img_size, 3), dtype=np.uint8)
-
-    def temporal_sampling(self, frames):
-        n = len(frames)
-        if n == 0:
-            return np.zeros((self.num_frames, self.img_size, self.img_size, 3), dtype=np.uint8)
-        
-        if n <= self.num_frames:
-            indices = list(range(n)) + [n-1] * (self.num_frames - n)
-        else:
-            indices = np.linspace(0, n-1, self.num_frames, dtype=int)
-        return frames[indices]
-
-    def resize_frames(self, frames):
-        resized = []
-        for frame in frames:
-            resized.append(cv2.resize(frame, (self.img_size, self.img_size)))
-        return np.array(resized)
-
-    def normalize(self, frames):
-        frames = frames.astype(np.float32) / 255.0
-        mean = np.array([0.485, 0.456, 0.406])
-        std = np.array([0.229, 0.224, 0.225])
-        frames = (frames - mean) / std
-        return frames
+            log.error(f"Load error {path}: {e}")
+            return np.zeros((self.num_frames, self.img_size, self.img_size, 3), np.uint8)
 
     def __getitem__(self, idx):
-        sample = self.samples[idx]
-        frames = self.load_video(sample['path'])
-        label = sample['class_idx']
+        path, label, _ = self.samples[idx]
+        frames = self._load_video(path)
+        n      = len(frames)
+        # Frame sampling — identical to training code
+        if n == 0:
+            frames = np.zeros((self.num_frames, self.img_size, self.img_size, 3), np.uint8)
+        elif n <= self.num_frames:
+            indices = list(range(n)) + [n - 1] * (self.num_frames - n)
+            frames  = frames[indices]
+        else:
+            indices = np.linspace(0, n - 1, self.num_frames, dtype=int)
+            frames  = frames[indices]
+        video = torch.stack([self.transform(Image.fromarray(f)) for f in frames], dim=0)
+        return video, label, path.name
 
-        frames = self.temporal_sampling(frames)
-        frames = self.resize_frames(frames)
-        frames = self.normalize(frames)
-        frames = torch.from_numpy(frames).permute(3, 0, 1, 2).float()
-        
-        return frames, label, sample['path'].name
 
-
-# -------------------------
-# Model Components (Same as Training)
-# -------------------------
-class PatchEmbed3D(nn.Module):
-    def __init__(self, img_size=96, patch_size=16, tubelet_size=2, in_chans=3, embed_dim=256):
+# ─────────────────────────────────────────────────────────────
+# Model — exact copy of training code
+# ─────────────────────────────────────────────────────────────
+class SimplePatchEmbed(nn.Module):
+    def __init__(self, img_size=112, patch_size=14, embed_dim=164):
         super().__init__()
-        self.proj = nn.Conv3d(
-            in_chans, embed_dim,
-            kernel_size=(tubelet_size, patch_size, patch_size),
-            stride=(tubelet_size, patch_size, patch_size)
-        )
-        
+        self.n_patches = (img_size // patch_size) ** 2
+        self.proj = nn.Conv2d(3, embed_dim, kernel_size=patch_size, stride=patch_size)
+
     def forward(self, x):
-        B, C, T, H, W = x.shape
-        x = self.proj(x)
-        B, E, Tp, Hp, Wp = x.shape
-        x = x.flatten(2).transpose(1, 2)
-        return x
+        return self.proj(x).flatten(2).transpose(1, 2)
 
 
-class Attention(nn.Module):
-    def __init__(self, dim, num_heads=8, qkv_bias=True, attn_drop=0., proj_drop=0.):
+class SimpleAttention(nn.Module):
+    def __init__(self, dim=164, heads=4, dropout=0.16):
         super().__init__()
-        self.num_heads = num_heads
-        head_dim = dim // num_heads
-        self.scale = head_dim ** -0.5
-
-        self.qkv = nn.Linear(dim, dim * 3, bias=qkv_bias)
-        self.attn_drop = nn.Dropout(attn_drop)
-        self.proj = nn.Linear(dim, dim)
-        self.proj_drop = nn.Dropout(proj_drop)
+        self.heads   = heads
+        self.scale   = (dim // heads) ** -0.5
+        self.qkv     = nn.Linear(dim, dim * 3, bias=True)
+        self.proj    = nn.Linear(dim, dim)
+        self.dropout = nn.Dropout(dropout)
 
     def forward(self, x):
         B, N, C = x.shape
-        qkv = self.qkv(x).reshape(B, N, 3, self.num_heads, C // self.num_heads).permute(2, 0, 3, 1, 4)
+        qkv = self.qkv(x).reshape(B, N, 3, self.heads,
+                                   C // self.heads).permute(2, 0, 3, 1, 4)
         q, k, v = qkv[0], qkv[1], qkv[2]
-
-        attn = (q @ k.transpose(-2, -1)) * self.scale
-        attn = attn.softmax(dim=-1)
-        attn = self.attn_drop(attn)
-
-        x = (attn @ v).transpose(1, 2).reshape(B, N, C)
-        x = self.proj(x)
-        x = self.proj_drop(x)
-        return x
+        attn = self.dropout((q @ k.transpose(-2, -1) * self.scale).softmax(dim=-1))
+        return self.dropout(self.proj((attn @ v).transpose(1, 2).reshape(B, N, C)))
 
 
-class MLP(nn.Module):
-    def __init__(self, in_features, hidden_features=None, drop=0.):
-        super().__init__()
-        hidden_features = hidden_features or in_features * 4
-        self.fc1 = nn.Linear(in_features, hidden_features)
-        self.act = nn.GELU()
-        self.drop1 = nn.Dropout(drop)
-        self.fc2 = nn.Linear(hidden_features, in_features)
-        self.drop2 = nn.Dropout(drop)
-
-    def forward(self, x):
-        x = self.fc1(x)
-        x = self.act(x)
-        x = self.drop1(x)
-        x = self.fc2(x)
-        x = self.drop2(x)
-        return x
-
-
-class TransformerBlock(nn.Module):
-    def __init__(self, dim, num_heads, mlp_ratio=4., drop=0., attn_drop=0.):
+class SimpleBlock(nn.Module):
+    """MLP as nn.Sequential so state-dict keys are mlp.0.* and mlp.3.*"""
+    def __init__(self, dim=164, heads=4, mlp_ratio=2.0, dropout=0.16):
         super().__init__()
         self.norm1 = nn.LayerNorm(dim)
-        self.attn = Attention(dim, num_heads=num_heads, attn_drop=attn_drop, proj_drop=drop)
+        self.attn  = SimpleAttention(dim, heads, dropout)
         self.norm2 = nn.LayerNorm(dim)
-        self.mlp = MLP(in_features=dim, hidden_features=int(dim * mlp_ratio), drop=drop)
+        h = int(dim * mlp_ratio)
+        self.mlp = nn.Sequential(
+            nn.Linear(dim, h), nn.GELU(), nn.Dropout(dropout),
+            nn.Linear(h, dim), nn.Dropout(dropout),
+        )
 
     def forward(self, x):
         x = x + self.attn(self.norm1(x))
@@ -208,752 +203,1037 @@ class TransformerBlock(nn.Module):
         return x
 
 
-class SlowLearningViViT(nn.Module):
-    def __init__(self, img_size=96, patch_size=16, tubelet_size=2, num_frames=8,
-                 in_chans=3, num_classes=1000, embed_dim=256, num_heads=8, num_layers=6,
-                 mlp_ratio=4., dropout=0.3, attention_dropout=0.3):
+class ConstrainedViViT(nn.Module):
+    """Identical to training code — architecture + weight initialisation."""
+    def __init__(self, num_classes=36, num_frames=16, img_size=112,
+                 patch_size=14, embed_dim=164, mlp_ratio=2.0,
+                 spatial_depth=2, temporal_depth=2, heads=4, dropout=0.16):
         super().__init__()
-        
-        self.patch_embed = PatchEmbed3D(
-            img_size=img_size, 
-            patch_size=patch_size,
-            tubelet_size=tubelet_size,
-            in_chans=in_chans, 
-            embed_dim=embed_dim
-        )
-        
-        num_patches = ((img_size // patch_size) ** 2) * (num_frames // tubelet_size)
-        
-        self.pos_embed = nn.Parameter(torch.zeros(1, num_patches, embed_dim))
-        self.pos_drop = nn.Dropout(p=dropout)
-        
-        self.blocks = nn.ModuleList([
-            TransformerBlock(
-                dim=embed_dim,
-                num_heads=num_heads,
-                mlp_ratio=mlp_ratio,
-                drop=dropout,
-                attn_drop=attention_dropout
-            )
-            for _ in range(num_layers)
-        ])
-        
+        self.num_frames = num_frames
+        self.embed_dim  = embed_dim
+
+        self.patch_embed = SimplePatchEmbed(img_size, patch_size, embed_dim)
+        n_patches        = self.patch_embed.n_patches
+
+        self.spatial_cls  = nn.Parameter(torch.randn(1, 1, embed_dim) * 0.02)
+        self.temporal_cls = nn.Parameter(torch.randn(1, 1, embed_dim) * 0.02)
+        self.spatial_pos  = nn.Parameter(torch.randn(1, n_patches + 1, embed_dim) * 0.02)
+        self.temporal_pos = nn.Parameter(torch.randn(1, num_frames + 1, embed_dim) * 0.02)
+
+        self.spatial_blocks  = nn.ModuleList(
+            [SimpleBlock(embed_dim, heads, mlp_ratio, dropout) for _ in range(spatial_depth)])
+        self.temporal_blocks = nn.ModuleList(
+            [SimpleBlock(embed_dim, heads, mlp_ratio, dropout) for _ in range(temporal_depth)])
+
         self.norm = nn.LayerNorm(embed_dim)
+        # head.0 = Linear, head.1 = GELU, head.2 = Dropout, head.3 = Linear
         self.head = nn.Sequential(
-            nn.Dropout(0.4),
-            nn.Linear(embed_dim, num_classes)
+            nn.Linear(embed_dim, embed_dim // 2), nn.GELU(), nn.Dropout(dropout),
+            nn.Linear(embed_dim // 2, num_classes),
         )
-        
-        self._init_weights()
-    
-    def _init_weights(self):
-        nn.init.trunc_normal_(self.pos_embed, std=0.02)
-        self.apply(self._init_weights_module)
-    
-    def _init_weights_module(self, m):
+        self.apply(self._init_weights)
+        log.info(f"ConstrainedViViT — {sum(p.numel() for p in self.parameters()):,} params")
+        log.info(f"  embed={embed_dim}, spatial={spatial_depth}, temporal={temporal_depth}, "
+                 f"heads={heads}, mlp_ratio={mlp_ratio}, dropout={dropout}")
+
+    def _init_weights(self, m):
         if isinstance(m, nn.Linear):
-            nn.init.trunc_normal_(m.weight, std=0.02)
-            if m.bias is not None:
-                nn.init.zeros_(m.bias)
+            nn.init.xavier_uniform_(m.weight)
+            if m.bias is not None: nn.init.constant_(m.bias, 0)
         elif isinstance(m, nn.LayerNorm):
-            nn.init.zeros_(m.bias)
-            nn.init.ones_(m.weight)
-    
+            nn.init.constant_(m.bias, 0); nn.init.constant_(m.weight, 1.0)
+        elif isinstance(m, nn.Conv2d):
+            nn.init.kaiming_normal_(m.weight, mode='fan_out')
+            if m.bias is not None: nn.init.constant_(m.bias, 0)
+
     def forward(self, x):
-        x = self.patch_embed(x)
-        x = x + self.pos_embed
-        x = self.pos_drop(x)
-        
-        for block in self.blocks:
-            x = block(x)
-        
-        x = self.norm(x)
-        x = x.mean(dim=1)
-        x = self.head(x)
-        return x
+        B, T, C, H, W = x.shape
+        # Spatial
+        x = self.patch_embed(x.view(B * T, C, H, W))
+        x = torch.cat([self.spatial_cls.expand(B * T, -1, -1), x], dim=1) + self.spatial_pos
+        for blk in self.spatial_blocks: x = blk(x)
+        x = x[:, 0]
+        # Temporal
+        x = x.view(B, T, self.embed_dim)
+        x = torch.cat([self.temporal_cls.expand(B, -1, -1), x], dim=1) + self.temporal_pos
+        for blk in self.temporal_blocks: x = blk(x)
+        return self.head(self.norm(x[:, 0]))
 
 
-# -------------------------
-# Testing Plotter (UPDATED WITH PR CURVES)
-# -------------------------
-class TestingPlotter:
-    def __init__(self, plot_dir):
-        self.plot_dir = Path(plot_dir)
-        self.plot_dir.mkdir(parents=True, exist_ok=True)
-        
-        # Create subdirectory for individual PR curves
-        self.pr_curves_dir = self.plot_dir / 'pr_curves_individual'
-        self.pr_curves_dir.mkdir(parents=True, exist_ok=True)
-        
-        logger.info(f"📊 Test plots will be saved to: {self.plot_dir}")
-        logger.info(f"📈 Individual PR curves will be saved to: {self.pr_curves_dir}")
-    
-    def plot_confusion_matrix(self, y_true, y_pred, class_names):
-        """Plot confusion matrix with counts only - matching 3D CNN style"""
-        cm = confusion_matrix(y_true, y_pred)
-        
-        # Create figure with appropriate size
-        fig_size = max(16, len(class_names) * 0.6)
-        plt.figure(figsize=(fig_size, fig_size * 0.9))
-        
-        # Plot with counts - matching 3D CNN style
-        sns.heatmap(cm, annot=True, fmt='d', cmap='Blues',
-                   xticklabels=class_names, yticklabels=class_names,
-                   cbar_kws={'label': 'Count'}, linewidths=0.5, linecolor='gray')
-        
-        plt.title('Confusion Matrix (Counts)', fontsize=18, fontweight='bold', pad=20)
-        plt.xlabel('Predicted Label', fontsize=14, fontweight='bold')
-        plt.ylabel('True Label', fontsize=14, fontweight='bold')
-        plt.xticks(rotation=45, ha='right')
-        plt.yticks(rotation=0)
-        
-        plt.tight_layout()
-        plt.savefig(self.plot_dir / 'confusion_matrix.png', dpi=400, bbox_inches='tight')
-        plt.close()
-        logger.info("✓ Confusion matrix saved (400 DPI)")
-    
-    def plot_normalized_confusion_matrix(self, y_true, y_pred, class_names):
-        """Plot normalized confusion matrix (percentages)"""
-        cm = confusion_matrix(y_true, y_pred)
-        cm_normalized = cm.astype('float') / cm.sum(axis=1)[:, np.newaxis]
-        
-        fig_size = max(16, len(class_names) * 0.6)
-        plt.figure(figsize=(fig_size, fig_size * 0.9))
-        
-        sns.heatmap(cm_normalized, annot=True, fmt='.2%', cmap='RdYlGn', 
-                   xticklabels=class_names, yticklabels=class_names,
-                   vmin=0, vmax=1, cbar_kws={'label': 'Percentage'},
-                   linewidths=0.5, linecolor='gray')
-        
-        plt.title('Normalized Confusion Matrix (%)', fontsize=18, fontweight='bold', pad=20)
-        plt.xlabel('Predicted Label', fontsize=14, fontweight='bold')
-        plt.ylabel('True Label', fontsize=14, fontweight='bold')
-        plt.xticks(rotation=45, ha='right')
-        plt.yticks(rotation=0)
-        
-        plt.tight_layout()
-        plt.savefig(self.plot_dir / 'confusion_matrix_normalized.png', dpi=400, bbox_inches='tight')
-        plt.close()
-        logger.info("✓ Normalized confusion matrix saved (400 DPI)")
-    
-    def plot_pr_curves_combined(self, y_true, y_probs, class_names):
-        """Plot all PR curves on one graph with AP scores"""
-        plt.figure(figsize=(14, 10))
-        
-        # Generate colors for each class
-        colors = plt.cm.tab20(np.linspace(0, 1, len(class_names)))
-        
-        # Store AP scores for sorting
-        ap_scores = []
-        
-        # Plot PR curve for each class
-        for i, class_name in enumerate(class_names):
-            # Convert to binary classification (one vs rest)
-            y_true_binary = (y_true == i).astype(int)
-            y_scores = y_probs[:, i]
-            
-            # Calculate precision-recall curve
-            precision, recall, _ = precision_recall_curve(y_true_binary, y_scores)
-            ap = average_precision_score(y_true_binary, y_scores)
-            ap_scores.append((class_name, ap))
-            
-            # Plot with class name and AP score in legend
-            plt.plot(recall, precision, color=colors[i], lw=1.5, alpha=0.8,
-                    label=f'{class_name} (AP={ap:.3f})')
-        
-        plt.xlabel('Recall', fontsize=13, fontweight='bold')
-        plt.ylabel('Precision', fontsize=13, fontweight='bold')
-        plt.title('Precision-Recall Curves - All Classes', fontsize=16, fontweight='bold', pad=15)
-        plt.grid(True, alpha=0.3, linestyle='--')
-        plt.xlim([0.0, 1.0])
-        plt.ylim([0.0, 1.05])
-        
-        # Place legend in bottom center inside the plot
-        plt.legend(loc='lower center', fontsize=8, framealpha=0.9, ncol=2)
-        
-        plt.tight_layout()
-        plt.savefig(self.plot_dir / 'pr_curves_combined.png', dpi=400, bbox_inches='tight')
-        plt.close()
-        logger.info("✓ Combined PR curves saved (400 DPI)")
-        
-        # Calculate and log mean AP
-        mean_ap = np.mean([ap for _, ap in ap_scores])
-        logger.info(f"  Mean Average Precision (mAP): {mean_ap:.4f}")
-        
-        return ap_scores, mean_ap
-    
-    def plot_pr_curves_individual(self, y_true, y_probs, class_names):
-        """Plot individual PR curves for each class in separate files"""
-        logger.info("Generating individual PR curves...")
-        
-        ap_scores = []
-        
-        for i, class_name in enumerate(class_names):
-            # Convert to binary classification
-            y_true_binary = (y_true == i).astype(int)
-            y_scores = y_probs[:, i]
-            
-            # Calculate precision-recall curve
-            precision, recall, _ = precision_recall_curve(y_true_binary, y_scores)
-            ap = average_precision_score(y_true_binary, y_scores)
-            ap_scores.append(ap)
-            
-            # Create individual plot
-            plt.figure(figsize=(10, 8))
-            plt.plot(recall, precision, color='#2E86AB', lw=3, label=f'AP = {ap:.3f}')
-            plt.fill_between(recall, precision, alpha=0.3, color='#A23B72')
-            
-            plt.xlabel('Recall', fontsize=13, fontweight='bold')
-            plt.ylabel('Precision', fontsize=13, fontweight='bold')
-            plt.title(f'Precision-Recall Curve: {class_name}', fontsize=15, fontweight='bold', pad=15)
-            plt.grid(True, alpha=0.3, linestyle='--')
-            plt.xlim([0.0, 1.0])
-            plt.ylim([0.0, 1.05])
-            plt.legend(loc='best', fontsize=12, framealpha=0.9)
-            
-            # Add text box with statistics
-            num_samples = np.sum(y_true_binary)
-            text_str = f'Samples: {num_samples}\nAP: {ap:.4f}'
-            plt.text(0.05, 0.05, text_str, transform=plt.gca().transAxes,
-                    fontsize=11, verticalalignment='bottom',
-                    bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.5))
-            
-            plt.tight_layout()
-            
-            # Save with sanitized filename
-            safe_filename = class_name.replace('/', '_').replace('\\', '_')
-            plt.savefig(self.pr_curves_dir / f'pr_curve_{safe_filename}.png', 
-                       dpi=300, bbox_inches='tight')
-            plt.close()
-        
-        logger.info(f"✓ {len(class_names)} individual PR curves saved (300 DPI)")
-        return ap_scores
-    
-    def plot_per_class_metrics(self, class_names, precisions, recalls, f1_scores, supports):
-        """Plot per-class performance metrics - improved style"""
-        fig, axes = plt.subplots(2, 2, figsize=(16, 12))
-        
-        x = np.arange(len(class_names))
-        width = 0.6
-        
-        # Precision
-        bars1 = axes[0, 0].bar(x, precisions, width, color='#3498db', alpha=0.85)
-        axes[0, 0].set_ylabel('Precision', fontsize=13, fontweight='bold')
-        axes[0, 0].set_title('Precision per Class', fontsize=15, fontweight='bold', pad=15)
-        axes[0, 0].set_xticks(x)
-        axes[0, 0].set_xticklabels(class_names, rotation=45, ha='right')
-        axes[0, 0].set_ylim([0, 1.05])
-        axes[0, 0].grid(True, alpha=0.3, axis='y', linestyle='--')
-        axes[0, 0].axhline(y=np.mean(precisions), color='red', linestyle='--', linewidth=2,
-                          label=f'Mean: {np.mean(precisions):.3f}')
-        axes[0, 0].legend(fontsize=11, framealpha=0.9)
-        
-        # Recall
-        bars2 = axes[0, 1].bar(x, recalls, width, color='#2ecc71', alpha=0.85)
-        axes[0, 1].set_ylabel('Recall', fontsize=13, fontweight='bold')
-        axes[0, 1].set_title('Recall per Class', fontsize=15, fontweight='bold', pad=15)
-        axes[0, 1].set_xticks(x)
-        axes[0, 1].set_xticklabels(class_names, rotation=45, ha='right')
-        axes[0, 1].set_ylim([0, 1.05])
-        axes[0, 1].grid(True, alpha=0.3, axis='y', linestyle='--')
-        axes[0, 1].axhline(y=np.mean(recalls), color='red', linestyle='--', linewidth=2,
-                          label=f'Mean: {np.mean(recalls):.3f}')
-        axes[0, 1].legend(fontsize=11, framealpha=0.9)
-        
-        # F1-Score
-        bars3 = axes[1, 0].bar(x, f1_scores, width, color='#e74c3c', alpha=0.85)
-        axes[1, 0].set_ylabel('F1-Score', fontsize=13, fontweight='bold')
-        axes[1, 0].set_title('F1-Score per Class', fontsize=15, fontweight='bold', pad=15)
-        axes[1, 0].set_xticks(x)
-        axes[1, 0].set_xticklabels(class_names, rotation=45, ha='right')
-        axes[1, 0].set_ylim([0, 1.05])
-        axes[1, 0].grid(True, alpha=0.3, axis='y', linestyle='--')
-        axes[1, 0].axhline(y=np.mean(f1_scores), color='red', linestyle='--', linewidth=2,
-                          label=f'Mean: {np.mean(f1_scores):.3f}')
-        axes[1, 0].legend(fontsize=11, framealpha=0.9)
-        
-        # Support (number of samples)
-        bars4 = axes[1, 1].bar(x, supports, width, color='#9b59b6', alpha=0.85)
-        axes[1, 1].set_ylabel('Number of Samples', fontsize=13, fontweight='bold')
-        axes[1, 1].set_title('Support per Class', fontsize=15, fontweight='bold', pad=15)
-        axes[1, 1].set_xticks(x)
-        axes[1, 1].set_xticklabels(class_names, rotation=45, ha='right')
-        axes[1, 1].grid(True, alpha=0.3, axis='y', linestyle='--')
-        axes[1, 1].axhline(y=np.mean(supports), color='red', linestyle='--', linewidth=2,
-                          label=f'Mean: {np.mean(supports):.1f}')
-        axes[1, 1].legend(fontsize=11, framealpha=0.9)
-        
-        plt.tight_layout()
-        plt.savefig(self.plot_dir / 'per_class_metrics.png', dpi=400, bbox_inches='tight')
-        plt.close()
-        logger.info("✓ Per-class metrics plot saved (400 DPI)")
-    
-    def plot_top_k_accuracy(self, top_k_accs):
-        """Plot Top-K accuracy"""
-        plt.figure(figsize=(10, 6))
-        
-        k_values = list(top_k_accs.keys())
-        accuracies = [top_k_accs[k] * 100 for k in k_values]
-        
-        plt.plot(k_values, accuracies, 'o-', linewidth=2.5, markersize=10, color='#3498db')
-        plt.title('Top-K Accuracy', fontsize=16, fontweight='bold', pad=15)
-        plt.xlabel('K', fontsize=13, fontweight='bold')
-        plt.ylabel('Accuracy (%)', fontsize=13, fontweight='bold')
-        plt.grid(True, alpha=0.3, linestyle='--')
-        plt.ylim([0, 105])
-        
-        for k, acc in zip(k_values, accuracies):
-            plt.text(k, acc + 2, f'{acc:.1f}%', ha='center', fontsize=11, fontweight='bold')
-        
-        plt.tight_layout()
-        plt.savefig(self.plot_dir / 'top_k_accuracy.png', dpi=400, bbox_inches='tight')
-        plt.close()
-        logger.info("✓ Top-K accuracy plot saved (400 DPI)")
-    
-    def create_summary_report(self, metrics, config, save_path):
-        """Create a comprehensive summary report"""
-        fig = plt.figure(figsize=(16, 10))
-        ax = fig.add_subplot(111)
-        ax.axis('off')
-        
-        summary_text = f"""
-╔═══════════════════════════════════════════════════════════════════════╗
-║                     MODEL TESTING SUMMARY REPORT                      ║
-╚═══════════════════════════════════════════════════════════════════════╝
+# ─────────────────────────────────────────────────────────────
+# Auto-detect config from checkpoint shapes
+# ─────────────────────────────────────────────────────────────
+def infer_config(sd):
+    """
+    Reads every architecture dimension from checkpoint tensor shapes.
+    Works for ANY ConstrainedViViT checkpoint — no manual config editing.
 
-📊 OVERALL PERFORMANCE
-{'='*75}
-  • Overall Accuracy:        {metrics['accuracy']*100:6.2f}%
-  • Macro Avg Precision:     {metrics['macro_precision']*100:6.2f}%
-  • Macro Avg Recall:        {metrics['macro_recall']*100:6.2f}%
-  • Macro Avg F1-Score:      {metrics['macro_f1']*100:6.2f}%
-  • Weighted Avg F1-Score:   {metrics['weighted_f1']*100:6.2f}%
-  • Mean Average Precision:  {metrics.get('mean_ap', 0)*100:6.2f}%
+    Derivation
+    ───────────
+    spatial_cls           [1, 1, E]   → embed_dim  = E
+    temporal_pos          [1, T+1, E] → num_frames = T
+    patch_embed.proj.w    [E, 3, p, p]→ patch_size = p
+    spatial_pos           [1, P+1, E] → img_size   = sqrt(P) * p
+    spatial_blocks.0.mlp.0.w [H, E]  → mlp_ratio  = H / E
+    count of *.norm1.weight keys      → depth
+    """
+    E          = int(sd['spatial_cls'].shape[2])
+    num_frames = int(sd['temporal_pos'].shape[1]) - 1
+    patch_size = int(sd['patch_embed.proj.weight'].shape[2])
+    n_patches  = int(sd['spatial_pos'].shape[1]) - 1
+    img_size   = int(round((n_patches ** 0.5) * patch_size))
+    mlp_ratio  = int(sd['spatial_blocks.0.mlp.0.weight'].shape[0]) / E
 
-📈 TOP-K ACCURACY
-{'='*75}
-  • Top-1 Accuracy:          {metrics['top_1_acc']*100:6.2f}%
-  • Top-3 Accuracy:          {metrics['top_3_acc']*100:6.2f}%
-  • Top-5 Accuracy:          {metrics['top_5_acc']*100:6.2f}%
+    s_depth = sum(1 for k in sd if k.startswith('spatial_blocks.')  and k.endswith('.norm1.weight'))
+    t_depth = sum(1 for k in sd if k.startswith('temporal_blocks.') and k.endswith('.norm1.weight'))
 
-🎯 DATASET INFORMATION
-{'='*75}
-  • Number of Classes:       {metrics['num_classes']}
-  • Total Test Samples:      {metrics['total_samples']}
-  • Samples per Class:       {metrics['samples_per_class']:.1f} (avg)
+    cfg = dict(embed_dim=E, num_frames=num_frames, img_size=img_size,
+               patch_size=patch_size, mlp_ratio=mlp_ratio,
+               spatial_depth=s_depth, temporal_depth=t_depth,
+               num_heads=4, dropout=0.16, batch_size=24)
 
-⚙️  MODEL CONFIGURATION
-{'='*75}
-  • Model Architecture:      ViViT (Video Vision Transformer)
-  • Embedding Dimension:     {config.get('embed_dim', 'N/A')}
-  • Number of Layers:        {config.get('num_layers', 'N/A')}
-  • Number of Heads:         {config.get('num_heads', 'N/A')}
-  • Image Size:              {config.get('img_size', 'N/A')}x{config.get('img_size', 'N/A')}
-  • Number of Frames:        {config.get('num_frames', 'N/A')}
-  • Dropout Rate:            {config.get('dropout_rate', 'N/A')}
+    log.info("Config auto-detected from checkpoint:")
+    for k, v in cfg.items():
+        log.info(f"  {k:<16}: {v}")
+    return cfg
 
-🔍 BEST & WORST PERFORMING CLASSES
-{'='*75}
-  Best Class:  {metrics['best_class']['name']} (F1: {metrics['best_class']['f1']*100:.2f}%)
-  Worst Class: {metrics['worst_class']['name']} (F1: {metrics['worst_class']['f1']*100:.2f}%)
 
-📅 TEST DATE: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
-{'='*75}
+# ─────────────────────────────────────────────────────────────
+# Checkpoint loading
+# ─────────────────────────────────────────────────────────────
+def load_checkpoint(path, device):
+    raw = torch.load(path, map_location=device, weights_only=False)
+    if not isinstance(raw, dict):
+        raise TypeError(f"Expected dict, got {type(raw)}")
+    # Training code saves under 'model_state_dict'
+    if 'model_state_dict' in raw:
+        sd, class_names = raw['model_state_dict'], raw.get('class_names')
+        meta = {'epoch': raw.get('epoch', 'N/A'), 'val_acc': raw.get('accuracy')}
+    elif 'model' in raw:
+        sd, class_names = raw['model'], raw.get('class_names')
+        meta = {'epoch': raw.get('epoch', 'N/A'), 'val_acc': raw.get('vl_acc')}
+    elif 'state_dict' in raw:
+        sd, class_names = raw['state_dict'], None
+        meta = {'epoch': raw.get('epoch', 'N/A'), 'val_acc': None}
+    else:
+        sd, class_names, meta = raw, None, {'epoch': 'N/A', 'val_acc': None}
 
+    log.info(f"Checkpoint loaded : {path}")
+    log.info(f"  epoch           : {meta['epoch']}")
+    if isinstance(meta.get('val_acc'), float):
+        log.info(f"  val accuracy    : {meta['val_acc']*100:.2f}%")
+    if class_names:
+        log.info(f"  class_names     : {len(class_names)} classes")
+    return sd, class_names, meta
+
+
+# ─────────────────────────────────────────────────────────────
+# Inference
+# ─────────────────────────────────────────────────────────────
+@torch.no_grad()
+def run_inference(model, loader, device):
+    model.eval()
+    preds, labels, probs, files = [], [], [], []
+    for videos, lbls, fnames in tqdm(loader, desc='  Inference', ncols=90):
+        videos = videos.to(device)
+        logits = model(videos)
+        p      = torch.softmax(logits, dim=1)
+        preds.extend(logits.argmax(1).cpu().numpy())
+        labels.extend(lbls.numpy())
+        probs.extend(p.cpu().numpy())
+        files.extend(fnames)
+    return np.array(preds), np.array(labels), np.array(probs), files
+
+
+# ─────────────────────────────────────────────────────────────
+# Metrics
+# ─────────────────────────────────────────────────────────────
+def compute_metrics(y_true, y_pred, y_probs, cn):
+    report = classification_report(y_true, y_pred, target_names=cn, output_dict=True)
+    f1_per = [report[c]['f1-score'] for c in cn]
+    top_k  = {k: float(top_k_accuracy_score(y_true, y_probs, k=k))
+               for k in [1, 3, 5] if k <= len(cn)}
+    per_ap  = {c: float(average_precision_score((y_true==i).astype(int), y_probs[:,i]))
+               for i, c in enumerate(cn)}
+    per_auc = {}
+    for i, c in enumerate(cn):
+        fpr, tpr, _ = roc_curve((y_true==i).astype(int), y_probs[:,i])
+        per_auc[c]  = float(auc(fpr, tpr))
+    return {
+        'accuracy':          float(accuracy_score(y_true, y_pred)),
+        'balanced_accuracy': float(balanced_accuracy_score(y_true, y_pred)),
+        'macro_precision':   float(precision_score(y_true, y_pred, average='macro')),
+        'macro_recall':      float(recall_score(y_true, y_pred, average='macro')),
+        'macro_f1':          float(f1_score(y_true, y_pred, average='macro')),
+        'weighted_f1':       float(f1_score(y_true, y_pred, average='weighted')),
+        'mean_ap':           float(np.mean(list(per_ap.values()))),
+        'mean_auc':          float(np.mean(list(per_auc.values()))),
+        'top_k': top_k, 'per_class_ap': per_ap, 'per_class_auc': per_auc,
+        'class_report': report,
+        'best_class':    cn[int(np.argmax(f1_per))],
+        'worst_class':   cn[int(np.argmin(f1_per))],
+        'best_class_f1':  float(max(f1_per)),
+        'worst_class_f1': float(min(f1_per)),
+        'num_classes':   len(cn), 'total_samples': int(len(y_true)),
+    }
+
+
+# ─────────────────────────────────────────────────────────────
+# Plots
+# ─────────────────────────────────────────────────────────────
+CB = '#2E86AB'; CR = '#E84855'; CG = '#44BBA4'; CP = '#7B2D8B'
+
+def _save(fig, path, dpi=400):
+    fig.savefig(path, dpi=dpi, bbox_inches='tight'); plt.close(fig)
+    log.info(f"  ✓  {Path(path).name}")
+
+
+def plot_cm_counts(y_true, y_pred, cn, out):
+    fs = max(16, len(cn) * 0.65)
+    fig, ax = plt.subplots(figsize=(fs, fs * 0.9))
+    sns.heatmap(confusion_matrix(y_true, y_pred), annot=True, fmt='d', cmap='Blues',
+                xticklabels=cn, yticklabels=cn, linewidths=0.4, linecolor='#ccc',
+                cbar_kws={'label': 'Count'}, ax=ax)
+    ax.set_title('Confusion Matrix — Counts', fontsize=17, fontweight='bold', pad=18)
+    ax.set_xlabel('Predicted', fontsize=13, fontweight='bold')
+    ax.set_ylabel('True',      fontsize=13, fontweight='bold')
+    ax.set_xticklabels(ax.get_xticklabels(), rotation=45, ha='right')
+    ax.set_yticklabels(ax.get_yticklabels(), rotation=0)
+    fig.tight_layout(); _save(fig, out / 'confusion_matrix_counts.png')
+
+
+def plot_cm_normalised(y_true, y_pred, cn, out):
+    cm  = confusion_matrix(y_true, y_pred)
+    cmn = cm.astype(float) / cm.sum(axis=1, keepdims=True)
+    fs  = max(16, len(cn) * 0.65)
+    fig, ax = plt.subplots(figsize=(fs, fs * 0.9))
+    sns.heatmap(cmn, annot=True, fmt='.2%', cmap='RdYlGn',
+                xticklabels=cn, yticklabels=cn, vmin=0, vmax=1,
+                linewidths=0.4, linecolor='#ccc',
+                cbar_kws={'label': 'Recall per class'}, ax=ax)
+    ax.set_title('Confusion Matrix — Normalised', fontsize=17, fontweight='bold', pad=18)
+    ax.set_xlabel('Predicted', fontsize=13, fontweight='bold')
+    ax.set_ylabel('True',      fontsize=13, fontweight='bold')
+    ax.set_xticklabels(ax.get_xticklabels(), rotation=45, ha='right')
+    ax.set_yticklabels(ax.get_yticklabels(), rotation=0)
+    fig.tight_layout(); _save(fig, out / 'confusion_matrix_normalised.png')
+
+
+def plot_per_class_metrics(cn, report, out):
+    x = np.arange(len(cn))
+    fig, axes = plt.subplots(2, 2, figsize=(18, 13))
+    for ax, key, label, color in [
+        (axes[0,0], 'precision', 'Precision', CB),
+        (axes[0,1], 'recall',    'Recall',    CG),
+        (axes[1,0], 'f1-score',  'F1-Score',  CR),
+        (axes[1,1], 'support',   'Support',   CP),
+    ]:
+        vals = [report[c][key] for c in cn]
+        ax.bar(x, vals, 0.65, color=color, alpha=0.82, edgecolor='white')
+        ax.set_title(f'{label} per Class', fontsize=14, fontweight='bold')
+        ax.set_xticks(x); ax.set_xticklabels(cn, rotation=45, ha='right', fontsize=9)
+        ax.grid(True, axis='y', alpha=0.25, ls='--')
+        if key != 'support': ax.set_ylim(0, 1.08)
+        m = np.mean(vals)
+        ax.axhline(m, color='black', ls='--', lw=1.5, label=f'Mean: {m:.3f}')
+        ax.legend(fontsize=10)
+    fig.suptitle('Per-Class Metrics — ConstrainedViViT', fontsize=17, fontweight='bold', y=1.01)
+    fig.tight_layout(); _save(fig, out / 'per_class_metrics.png')
+
+
+def plot_class_accuracy_sorted(y_true, y_pred, cn, out):
+    accs = [float((y_pred[y_true==i]==i).sum()/(y_true==i).sum()) if (y_true==i).sum() else 0.0
+            for i in range(len(cn))]
+    idx = np.argsort(accs)[::-1]
+    ns, vs = [cn[i] for i in idx], [accs[i] for i in idx]
+    fig, ax = plt.subplots(figsize=(14, max(8, len(cn) * 0.38)))
+    ax.barh(range(len(ns)), vs, color=plt.cm.RdYlGn(np.array(vs)), alpha=0.86, edgecolor='white')
+    ax.set_yticks(range(len(ns))); ax.set_yticklabels(ns, fontsize=10)
+    ax.set_xlabel('Accuracy', fontsize=12, fontweight='bold')
+    ax.set_title('Per-Class Accuracy (sorted)', fontsize=15, fontweight='bold')
+    ax.set_xlim(0, 1.12); ax.grid(True, axis='x', alpha=0.25, ls='--')
+    ax.axvline(np.mean(vs), color='black', ls='--', lw=1.5, label=f'Mean: {np.mean(vs):.3f}')
+    ax.legend()
+    for i, v in enumerate(vs): ax.text(v+0.01, i, f'{v:.3f}', va='center', fontsize=8.5)
+    fig.tight_layout(); _save(fig, out / 'class_accuracy_sorted.png')
+
+
+def plot_top_k(top_k_dict, out):
+    ks, vs = sorted(top_k_dict), [top_k_dict[k]*100 for k in sorted(top_k_dict)]
+    fig, ax = plt.subplots(figsize=(9, 5))
+    ax.plot(ks, vs, 'o-', lw=2.5, ms=9, color=CB)
+    ax.fill_between(ks, vs, alpha=0.12, color=CB)
+    for k, v in zip(ks, vs): ax.text(k, v+1.5, f'{v:.1f}%', ha='center', fontsize=11, fontweight='bold')
+    ax.set_xlabel('K', fontsize=13, fontweight='bold')
+    ax.set_ylabel('Accuracy (%)', fontsize=13, fontweight='bold')
+    ax.set_title('Top-K Accuracy', fontsize=15, fontweight='bold')
+    ax.set_xticks(ks); ax.set_ylim(0, 110); ax.grid(True, alpha=0.25, ls='--')
+    fig.tight_layout(); _save(fig, out / 'top_k_accuracy.png')
+
+
+def plot_pr_combined(y_true, y_probs, cn, out):
+    colors = plt.cm.tab20(np.linspace(0, 1, len(cn)))
+    fig, ax = plt.subplots(figsize=(15, 10))
+    ap_vals = []
+    for i, (c, col) in enumerate(zip(cn, colors)):
+        yb = (y_true==i).astype(int)
+        p, r, _ = precision_recall_curve(yb, y_probs[:,i])
+        ap = average_precision_score(yb, y_probs[:,i]); ap_vals.append(ap)
+        ax.plot(r, p, color=col, lw=1.5, alpha=0.85, label=f'{c}  AP={ap:.3f}')
+    ax.axhline(1/len(cn), color='gray', ls=':', lw=1.2, label=f'Random={1/len(cn):.3f}')
+    ax.set_xlabel('Recall', fontsize=13, fontweight='bold')
+    ax.set_ylabel('Precision', fontsize=13, fontweight='bold')
+    ax.set_title(f'PR Curves — All Classes  (mAP={np.mean(ap_vals):.4f})',
+                 fontsize=15, fontweight='bold')
+    ax.set_xlim(0,1); ax.set_ylim(0,1.05); ax.grid(True, alpha=0.2, ls='--')
+    ax.legend(loc='lower center', ncol=3, fontsize=7.5, framealpha=0.9)
+    fig.tight_layout(); _save(fig, out / 'pr_curves_combined.png')
+    log.info(f"    mAP = {np.mean(ap_vals):.4f}")
+
+
+def plot_pr_individual(y_true, y_probs, cn, ind_dir):
+    Path(ind_dir).mkdir(parents=True, exist_ok=True)
+    for i, c in enumerate(tqdm(cn, desc='  PR individual', ncols=80)):
+        yb = (y_true==i).astype(int)
+        p, r, thresh = precision_recall_curve(yb, y_probs[:,i])
+        ap = average_precision_score(yb, y_probs[:,i])
+        fig, (ax, ax2) = plt.subplots(1, 2, figsize=(14, 6))
+        ax.plot(r, p, color=CB, lw=2.8, label=f'AP={ap:.4f}')
+        ax.fill_between(r, p, alpha=0.18, color=CB)
+        ax.set_xlabel('Recall'); ax.set_ylabel('Precision')
+        ax.set_title(f'PR Curve: {c}', fontsize=14, fontweight='bold')
+        ax.set_xlim(0,1); ax.set_ylim(0,1.05); ax.grid(True, alpha=0.25, ls='--'); ax.legend()
+        ax.text(0.04, 0.08, f'Samples: {int(yb.sum())}\nAP: {ap:.4f}',
+                transform=ax.transAxes, fontsize=10,
+                bbox=dict(boxstyle='round', fc='wheat', alpha=0.55))
+        if len(thresh) > 0:
+            f1_t = np.where((p[:-1]+r[:-1])>0, 2*p[:-1]*r[:-1]/(p[:-1]+r[:-1]+1e-9), 0)
+            ax2.plot(thresh, p[:-1], color=CB, lw=2, label='Precision')
+            ax2.plot(thresh, r[:-1], color=CG,  lw=2, label='Recall')
+            ax2.plot(thresh, f1_t,   color=CR,  lw=2, label='F1')
+            ax2.axvline(thresh[np.argmax(f1_t)], color='black', ls='--', lw=1.2,
+                        label=f'Best F1@{thresh[np.argmax(f1_t)]:.2f}')
+        ax2.set_xlabel('Threshold'); ax2.set_ylabel('Score')
+        ax2.set_title(f'P/R/F1 vs Threshold: {c}', fontsize=14, fontweight='bold')
+        ax2.set_xlim(0,1); ax2.set_ylim(0,1.05); ax2.grid(True, alpha=0.25, ls='--'); ax2.legend()
+        fig.tight_layout()
+        _save(fig, Path(ind_dir)/f'pr_{c.replace("/","_")}.png', dpi=300)
+    log.info(f"  ✓  {len(cn)} individual PR curves")
+
+
+def plot_roc_combined(y_true, y_probs, cn, out):
+    colors = plt.cm.tab20(np.linspace(0, 1, len(cn)))
+    fig, ax = plt.subplots(figsize=(15, 10)); auc_vals = []
+    for i, (c, col) in enumerate(zip(cn, colors)):
+        yb = (y_true==i).astype(int)
+        fpr, tpr, _ = roc_curve(yb, y_probs[:,i])
+        a = auc(fpr, tpr); auc_vals.append(a)
+        ax.plot(fpr, tpr, color=col, lw=1.5, alpha=0.85, label=f'{c}  AUC={a:.3f}')
+    ax.plot([0,1],[0,1],'k--', lw=1.5, label='Random')
+    ax.set_xlabel('FPR', fontsize=13, fontweight='bold')
+    ax.set_ylabel('TPR', fontsize=13, fontweight='bold')
+    ax.set_title(f'ROC Curves — All Classes  (Mean AUC={np.mean(auc_vals):.4f})',
+                 fontsize=15, fontweight='bold')
+    ax.set_xlim(0,1); ax.set_ylim(0,1.05); ax.grid(True, alpha=0.2, ls='--')
+    ax.legend(loc='lower right', ncol=3, fontsize=7.5, framealpha=0.9)
+    fig.tight_layout(); _save(fig, out / 'roc_curves_combined.png')
+    log.info(f"    Mean AUC = {np.mean(auc_vals):.4f}")
+
+
+def plot_roc_individual(y_true, y_probs, cn, ind_dir):
+    Path(ind_dir).mkdir(parents=True, exist_ok=True)
+    for i, c in enumerate(tqdm(cn, desc='  ROC individual', ncols=80)):
+        yb = (y_true==i).astype(int)
+        fpr, tpr, thresh = roc_curve(yb, y_probs[:,i])
+        a = auc(fpr, tpr)
+        fig, (ax, ax2) = plt.subplots(1, 2, figsize=(14, 6))
+        ax.plot(fpr, tpr, color=CB, lw=2.8, label=f'AUC={a:.4f}')
+        ax.fill_between(fpr, tpr, alpha=0.18, color=CB)
+        ax.plot([0,1],[0,1],'k--', lw=1.3, label='Random')
+        ax.set_xlabel('FPR'); ax.set_ylabel('TPR')
+        ax.set_title(f'ROC Curve: {c}', fontsize=14, fontweight='bold')
+        ax.set_xlim(0,1); ax.set_ylim(0,1.05); ax.grid(True, alpha=0.25, ls='--'); ax.legend()
+        ax.text(0.55, 0.12, f'Samples: {int(yb.sum())}\nAUC: {a:.4f}',
+                transform=ax.transAxes, fontsize=10,
+                bbox=dict(boxstyle='round', fc='wheat', alpha=0.55))
+        if len(thresh) > 1:
+            youden = tpr[:-1] - fpr[:-1]
+            ax2.plot(thresh[1:], tpr[1:], color=CG, lw=2, label='TPR (Sensitivity)')
+            ax2.plot(thresh[1:], fpr[1:], color=CR,  lw=2, label='FPR (1-Specificity)')
+            ax2.plot(thresh[1:], youden,  color=CP,  lw=2, label="Youden's J")
+            ax2.axvline(thresh[np.argmax(youden)], color='black', ls='--', lw=1.2,
+                        label=f'Best J@{thresh[np.argmax(youden)]:.2f}')
+        ax2.set_xlabel('Threshold'); ax2.set_ylabel('Rate')
+        ax2.set_title(f'TPR/FPR/Youden: {c}', fontsize=14, fontweight='bold')
+        ax2.set_ylim(-0.05, 1.05); ax2.grid(True, alpha=0.25, ls='--'); ax2.legend()
+        fig.tight_layout()
+        _save(fig, Path(ind_dir)/f'roc_{c.replace("/","_")}.png', dpi=300)
+    log.info(f"  ✓  {len(cn)} individual ROC curves")
+
+
+def plot_calibration(y_true, y_probs, out):
+    max_p = y_probs.max(axis=1); is_ok = (y_probs.argmax(axis=1) == y_true)
+    fig, (ax, ax2) = plt.subplots(1, 2, figsize=(14, 6))
+    fp, mp = calibration_curve(is_ok, max_p, n_bins=10)
+    ax.plot([0,1],[0,1],'k--', lw=1.5, label='Perfect')
+    ax.plot(mp, fp, 'o-', lw=2, ms=7, color=CB, label='Model')
+    ax.fill_between(mp, fp, mp, alpha=0.12, color=CR, label='Gap')
+    ax.set_xlabel('Mean Predicted Confidence'); ax.set_ylabel('Fraction Correct')
+    ax.set_title('Reliability Diagram', fontsize=14, fontweight='bold')
+    ax.set_xlim(0,1); ax.set_ylim(0,1.05); ax.legend(); ax.grid(True, alpha=0.25, ls='--')
+    bins = np.linspace(0, 1, 26)
+    ax2.hist(max_p[is_ok],  bins=bins, color=CG, alpha=0.75, label='Correct',   edgecolor='white')
+    ax2.hist(max_p[~is_ok], bins=bins, color=CR, alpha=0.75, label='Incorrect', edgecolor='white')
+    ax2.set_xlabel('Max Softmax Confidence'); ax2.set_ylabel('Count')
+    ax2.set_title('Confidence Distribution', fontsize=14, fontweight='bold')
+    ax2.legend(); ax2.grid(True, alpha=0.25, ls='--')
+    fig.tight_layout(); _save(fig, out / 'calibration_and_confidence.png')
+
+def plot_misclassification_heatmap(y_true, y_pred, cn, out):
+    cm = confusion_matrix(y_true, y_pred)
+
+    misclass = cm.copy().astype(float)
+    np.fill_diagonal(misclass, 0)
+
+    fs = max(16, len(cn) * 0.65)
+    fig, ax = plt.subplots(figsize=(fs, fs * 0.9))
+
+    mask_zero    = misclass == 0
+    mask_nonzero = ~mask_zero
+
+    # Blank cells
+    sns.heatmap(misclass, annot=False, cmap=['#f7f7f7'],
+                mask=mask_nonzero, xticklabels=cn, yticklabels=cn,
+                linewidths=0.5, linecolor='lightgray', cbar=False, alpha=0.4, ax=ax)
+
+    # Error cells
+    sns.heatmap(misclass, annot=True, fmt='.0f', cmap='YlOrRd',
+                mask=mask_zero, xticklabels=cn, yticklabels=cn,
+                linewidths=0.5, linecolor='lightgray',
+                cbar_kws={'label': 'Number of Misclassifications'},
+                annot_kws={'size': 9}, ax=ax)
+
+    ax.set_title('Misclassification Heatmap\n(Diagonal removed — errors only)',
+                 fontsize=17, fontweight='bold', pad=18)
+    ax.set_xlabel('Predicted', fontsize=13, fontweight='bold')
+    ax.set_ylabel('True',      fontsize=13, fontweight='bold')
+    ax.set_xticklabels(ax.get_xticklabels(), rotation=45, ha='right')
+    ax.set_yticklabels(ax.get_yticklabels(), rotation=0)
+
+    # Row-level error totals on the right margin
+    row_errors = misclass.sum(axis=1)
+    for i, total in enumerate(row_errors):
+        if total > 0:
+            ax.text(len(cn) + 0.3, i + 0.5, f'Σ={int(total)}',
+                    va='center', ha='left', fontsize=9,
+                    color='#c0392b', fontweight='bold')
+
+    # Top banner: overall error count + rate
+    total_errors = int(misclass.sum())
+    error_rate   = total_errors / cm.sum() * 100
+    ax.set_title(
+        f'Misclassification Heatmap  —  {total_errors} errors  ({error_rate:.1f}% error rate)\n'
+        f'(Diagonal removed — off-diagonal errors only)',
+        fontsize=15, fontweight='bold', pad=18
+    )
+
+    fig.tight_layout()
+    _save(fig, out / 'misclassification_heatmap.png')
+
+class FPFNAnalyzer:
+    """
+    Per-class False Positive / False Negative error analysis.
+
+    For each class i:
+      FP = samples predicted as i but whose true label != i
+      FN = samples whose true label is i but predicted != i
+
+    Outputs:
+      plots/fp_fn_analysis/
+        fp_fn_rates.png
+        fp_fn_confidence_dist.png
+        fp_fn_confusion_pairs.png
+        fp_fn_threshold_sweep.png
+        fp_confusion_matrix.png / _normalized.png
+        fn_confusion_matrix.png / _normalized.png
+      metrics/
+        fp_fn_summary.csv
+        fp_fn_high_conf_errors.csv
+    """
+
+    def __init__(self, metrics_dir: Path, plots_dir: Path):
+        self.metrics_dir = metrics_dir
+        self.plots_dir   = plots_dir
+        self.error_dir   = plots_dir / 'fp_fn_analysis'
+        self.error_dir.mkdir(parents=True, exist_ok=True)
+        log.info(f"📂 FP/FN analysis outputs → {self.error_dir}")
+
+    # ------------------------------------------------------------------
+    # Public entry point
+    # ------------------------------------------------------------------
+    def analyze(self, y_true, y_pred, y_probs, class_names, filenames):
+        """Run all FP/FN analyses. Called from main() after save_metrics()."""
+        y_true  = np.array(y_true)
+        y_pred  = np.array(y_pred)
+        y_probs = np.array(y_probs)
+
+        summary_rows = []
+        for cls_idx, cls_name in enumerate(class_names):
+            fp_mask, fn_mask = self._masks(y_true, y_pred, cls_idx)
+            n_positive  = int((y_true == cls_idx).sum())
+            n_predicted = int((y_pred == cls_idx).sum())
+            n_fp        = int(fp_mask.sum())
+            n_fn        = int(fn_mask.sum())
+            fp_rate     = n_fp / max(n_predicted, 1)
+            fn_rate     = n_fn / max(n_positive,  1)
+            summary_rows.append({
+                'class':       cls_name,
+                'n_true':      n_positive,
+                'n_predicted': n_predicted,
+                'n_fp':        n_fp,
+                'n_fn':        n_fn,
+                'fp_rate':     round(fp_rate, 4),
+                'fn_rate':     round(fn_rate, 4),
+                'precision':   round(1 - fp_rate, 4),
+                'recall':      round(1 - fn_rate,  4),
+            })
+
+        summary_df = pd.DataFrame(summary_rows)
+        summary_df.to_csv(self.metrics_dir / 'fp_fn_summary.csv', index=False)
+        log.info("  ✓  fp_fn_summary.csv")
+
+        self._plot_fp_fn_rates(summary_df)
+        self._plot_confidence_distributions(y_true, y_pred, y_probs, class_names)
+        self._plot_confusion_pairs(y_true, y_pred, class_names)
+        self._plot_threshold_sweep(y_true, y_probs, class_names)
+        self._plot_fp_confusion_matrix(y_true, y_pred, class_names)
+        self._plot_fn_confusion_matrix(y_true, y_pred, class_names)
+        self._save_high_conf_errors(y_true, y_pred, y_probs, class_names, filenames)
+
+        log.info("✅  FP/FN analysis complete")
+        return summary_df
+
+    # ------------------------------------------------------------------
+    # Helpers
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _masks(y_true, y_pred, cls_idx):
+        fp_mask = (y_pred == cls_idx) & (y_true != cls_idx)
+        fn_mask = (y_true == cls_idx) & (y_pred != cls_idx)
+        return fp_mask, fn_mask
+
+    @staticmethod
+    def _save(fig, path, dpi=400):
+        fig.savefig(path, dpi=dpi, bbox_inches='tight')
+        plt.close(fig)
+        log.info(f"  ✓  {Path(path).name}")
+
+    # ------------------------------------------------------------------
+    # Plot 1 – per-class FP/FN rate bar chart
+    # ------------------------------------------------------------------
+    def _plot_fp_fn_rates(self, summary_df):
+        fig, axes = plt.subplots(1, 2, figsize=(18, max(6, len(summary_df) * 0.35)))
+
+        for ax, col, color, title in [
+            (axes[0], 'fp_rate', '#e74c3c',
+             'False Positive Rate\n(FP / predicted positives)'),
+            (axes[1], 'fn_rate', '#e67e22',
+             'False Negative Rate\n(FN / true positives  =  1 − recall)'),
+        ]:
+            sdf  = summary_df.sort_values(col, ascending=True)
+            bars = ax.barh(sdf['class'], sdf[col], color=color, alpha=0.80)
+            ax.set_xlim([0, 1.05])
+            ax.axvline(x=summary_df[col].mean(), color='navy', linestyle='--',
+                       linewidth=1.5, label=f'Mean: {summary_df[col].mean():.3f}')
+            ax.set_title(title, fontsize=13, fontweight='bold')
+            ax.set_xlabel('Rate', fontsize=11)
+            ax.grid(True, axis='x', alpha=0.3, linestyle='--')
+            ax.legend(fontsize=10)
+            for bar, val in zip(bars, sdf[col]):
+                ax.text(val + 0.01, bar.get_y() + bar.get_height() / 2,
+                        f'{val:.3f}', va='center', fontsize=8)
+
+        fig.tight_layout()
+        self._save(fig, self.error_dir / 'fp_fn_rates.png', dpi=400)
+
+    # ------------------------------------------------------------------
+    # Plot 2 – confidence distribution: correct vs FP vs FN
+    # ------------------------------------------------------------------
+    def _plot_confidence_distributions(self, y_true, y_pred, y_probs, class_names):
+        n_classes = len(class_names)
+        ncols = 4
+        nrows = (n_classes + ncols - 1) // ncols
+        fig, axes = plt.subplots(nrows, ncols,
+                                  figsize=(ncols * 4, nrows * 3.2), squeeze=False)
+
+        bins = np.linspace(0, 1, 21)
+        for cls_idx, cls_name in enumerate(class_names):
+            ax = axes[cls_idx // ncols][cls_idx % ncols]
+            fp_mask, fn_mask = self._masks(y_true, y_pred, cls_idx)
+            correct_mask     = (y_true == cls_idx) & (y_pred == cls_idx)
+
+            fp_conf = y_probs[fp_mask, cls_idx]
+            fn_conf = y_probs[fn_mask].max(axis=1)
+            ok_conf = y_probs[correct_mask, cls_idx]
+
+            ax.hist(ok_conf, bins=bins, alpha=0.55, color='#2ecc71',
+                    label=f'Correct ({len(ok_conf)})')
+            ax.hist(fp_conf, bins=bins, alpha=0.65, color='#e74c3c',
+                    label=f'FP ({len(fp_conf)})')
+            ax.hist(fn_conf, bins=bins, alpha=0.65, color='#e67e22',
+                    label=f'FN ({len(fn_conf)})')
+            ax.set_title(cls_name, fontsize=10, fontweight='bold')
+            ax.set_xlim([0, 1])
+            ax.set_xlabel('Confidence', fontsize=8)
+            ax.legend(fontsize=7, loc='upper left')
+            ax.grid(True, alpha=0.3)
+
+        for idx in range(n_classes, nrows * ncols):
+            axes[idx // ncols][idx % ncols].set_visible(False)
+
+        fig.suptitle('Confidence Distributions: Correct vs FP vs FN per Class',
+                     fontsize=14, fontweight='bold', y=1.01)
+        fig.tight_layout()
+        self._save(fig, self.error_dir / 'fp_fn_confidence_dist.png', dpi=300)
+
+    # ------------------------------------------------------------------
+    # Plot 3 – confusion pairs (FP sources / FN destinations)
+    # ------------------------------------------------------------------
+    def _plot_confusion_pairs(self, y_true, y_pred, class_names, top_n=6):
+        from collections import Counter
+        n_classes = len(class_names)
+        fig, axes = plt.subplots(n_classes, 2,
+                                  figsize=(14, max(n_classes * 2.2, 8)))
+        if n_classes == 1:
+            axes = np.array([axes])
+
+        for cls_idx, cls_name in enumerate(class_names):
+            fp_mask, fn_mask = self._masks(y_true, y_pred, cls_idx)
+            fp_true_labels   = y_true[fp_mask]
+            fn_pred_labels   = y_pred[fn_mask]
+
+            ax_fp = axes[cls_idx][0]
+            ax_fn = axes[cls_idx][1]
+
+            if len(fp_true_labels):
+                fp_top   = sorted(Counter(fp_true_labels).items(),
+                                  key=lambda x: -x[1])[:top_n]
+                fp_names = [class_names[i] for i, _ in fp_top]
+                fp_vals  = [v for _, v in fp_top]
+                ax_fp.barh(fp_names, fp_vals, color='#e74c3c', alpha=0.8)
+            ax_fp.set_title(f'{cls_name} – FP sources', fontsize=9, fontweight='bold')
+            ax_fp.set_xlabel('Count', fontsize=8)
+            ax_fp.grid(True, axis='x', alpha=0.3)
+
+            if len(fn_pred_labels):
+                fn_top   = sorted(Counter(fn_pred_labels).items(),
+                                  key=lambda x: -x[1])[:top_n]
+                fn_names = [class_names[i] for i, _ in fn_top]
+                fn_vals  = [v for _, v in fn_top]
+                ax_fn.barh(fn_names, fn_vals, color='#e67e22', alpha=0.8)
+            ax_fn.set_title(f'{cls_name} – FN destinations', fontsize=9, fontweight='bold')
+            ax_fn.set_xlabel('Count', fontsize=8)
+            ax_fn.grid(True, axis='x', alpha=0.3)
+
+        fig.suptitle('FP Sources and FN Destinations per Class',
+                     fontsize=14, fontweight='bold', y=1.005)
+        fig.tight_layout()
+        self._save(fig, self.error_dir / 'fp_fn_confusion_pairs.png', dpi=300)
+
+    # ------------------------------------------------------------------
+    # Plot 4 – threshold sweep: FP-rate vs FN-rate trade-off
+    # ------------------------------------------------------------------
+    def _plot_threshold_sweep(self, y_true, y_probs, class_names):
+        thresholds = np.linspace(0.01, 0.99, 99)
+        n_classes  = len(class_names)
+        ncols = 4
+        nrows = (n_classes + ncols - 1) // ncols
+        fig, axes = plt.subplots(nrows, ncols,
+                                  figsize=(ncols * 4, nrows * 3.2), squeeze=False)
+
+        for cls_idx, cls_name in enumerate(class_names):
+            ax          = axes[cls_idx // ncols][cls_idx % ncols]
+            scores      = y_probs[:, cls_idx]
+            binary_true = (y_true == cls_idx).astype(int)
+            fp_rates, fn_rates = [], []
+
+            for t in thresholds:
+                predicted = (scores >= t).astype(int)
+                tp = int(((predicted == 1) & (binary_true == 1)).sum())
+                fp = int(((predicted == 1) & (binary_true == 0)).sum())
+                fn = int(((predicted == 0) & (binary_true == 1)).sum())
+                tn = int(((predicted == 0) & (binary_true == 0)).sum())
+                fp_rates.append(fp / max(fp + tn, 1))
+                fn_rates.append(fn / max(tp + fn, 1))
+
+            ax.plot(thresholds, fp_rates, color='#e74c3c', lw=2, label='FP rate')
+            ax.plot(thresholds, fn_rates, color='#e67e22', lw=2, label='FN rate')
+
+            cross_idx = np.argmin(np.abs(np.array(fp_rates) - np.array(fn_rates)))
+            ax.axvline(thresholds[cross_idx], color='navy', linestyle='--',
+                       linewidth=1, label=f'Cross @ {thresholds[cross_idx]:.2f}')
+
+            ax.set_title(cls_name, fontsize=10, fontweight='bold')
+            ax.set_xlabel('Threshold', fontsize=8)
+            ax.set_ylabel('Rate',      fontsize=8)
+            ax.set_xlim([0, 1])
+            ax.set_ylim([0, 1.05])
+            ax.legend(fontsize=7)
+            ax.grid(True, alpha=0.3)
+
+        for idx in range(n_classes, nrows * ncols):
+            axes[idx // ncols][idx % ncols].set_visible(False)
+
+        fig.suptitle('Threshold Sweep: FP Rate vs FN Rate per Class\n'
+                     '(dashed = equal-error threshold)',
+                     fontsize=14, fontweight='bold', y=1.01)
+        fig.tight_layout()
+        self._save(fig, self.error_dir / 'fp_fn_threshold_sweep.png', dpi=300)
+
+    # ------------------------------------------------------------------
+    # Plot 5 – FP confusion matrix (Reds) — counts + normalised
+    # ------------------------------------------------------------------
+    def _plot_fp_confusion_matrix(self, y_true, y_pred, class_names):
+        cm        = confusion_matrix(y_true, y_pred)
+        fp_matrix = cm.copy().astype(float)
+        np.fill_diagonal(fp_matrix, 0)
+        fig_size  = max(16, len(class_names) * 0.65)
+
+        # Counts
+        fig, ax = plt.subplots(figsize=(fig_size, fig_size * 0.9))
+        mask = fp_matrix == 0
+        sns.heatmap(fp_matrix, annot=True, fmt='.0f', cmap='Reds', mask=mask,
+                    xticklabels=class_names, yticklabels=class_names,
+                    linewidths=0.5, linecolor='lightgray',
+                    cbar_kws={'label': 'FP count'}, annot_kws={'size': 9}, ax=ax)
+        sns.heatmap(fp_matrix, annot=False, cmap=['#f7f7f7'], mask=~mask,
+                    xticklabels=class_names, yticklabels=class_names,
+                    linewidths=0.5, linecolor='lightgray',
+                    cbar=False, alpha=0.4, ax=ax)
+        ax.set_title('False Positive Matrix (counts)\n'
+                     'Column = predicted class  |  Row = true class  |  Diagonal removed',
+                     fontsize=15, fontweight='bold', pad=18)
+        ax.set_xlabel('Predicted', fontsize=13, fontweight='bold')
+        ax.set_ylabel('True',      fontsize=13, fontweight='bold')
+        ax.set_xticklabels(ax.get_xticklabels(), rotation=45, ha='right')
+        ax.set_yticklabels(ax.get_yticklabels(), rotation=0)
+        fig.tight_layout()
+        self._save(fig, self.error_dir / 'fp_confusion_matrix.png', dpi=400)
+
+        # Normalised
+        row_sums  = cm.sum(axis=1, keepdims=True)
+        fp_norm   = np.where(row_sums > 0, fp_matrix / row_sums, 0)
+        np.fill_diagonal(fp_norm, 0)
+        mask_norm = fp_norm == 0
+
+        fig, ax = plt.subplots(figsize=(fig_size, fig_size * 0.9))
+        sns.heatmap(fp_norm, annot=True, fmt='.2%', cmap='Reds', mask=mask_norm,
+                    xticklabels=class_names, yticklabels=class_names,
+                    vmin=0, vmax=1, linewidths=0.5, linecolor='lightgray',
+                    cbar_kws={'label': 'FP rate (% of true class)'},
+                    annot_kws={'size': 9}, ax=ax)
+        sns.heatmap(fp_norm, annot=False, cmap=['#f7f7f7'], mask=~mask_norm,
+                    xticklabels=class_names, yticklabels=class_names,
+                    linewidths=0.5, linecolor='lightgray',
+                    cbar=False, alpha=0.4, ax=ax)
+        ax.set_title('False Positive Matrix (normalised %)\n'
+                     'Column = predicted class  |  Row = true class  |  Diagonal removed',
+                     fontsize=15, fontweight='bold', pad=18)
+        ax.set_xlabel('Predicted', fontsize=13, fontweight='bold')
+        ax.set_ylabel('True',      fontsize=13, fontweight='bold')
+        ax.set_xticklabels(ax.get_xticklabels(), rotation=45, ha='right')
+        ax.set_yticklabels(ax.get_yticklabels(), rotation=0)
+        fig.tight_layout()
+        self._save(fig, self.error_dir / 'fp_confusion_matrix_normalized.png', dpi=400)
+
+    # ------------------------------------------------------------------
+    # Plot 6 – FN confusion matrix (Oranges) — counts + normalised
+    # ------------------------------------------------------------------
+    def _plot_fn_confusion_matrix(self, y_true, y_pred, class_names):
+        cm        = confusion_matrix(y_true, y_pred)
+        fn_matrix = cm.copy().astype(float)
+        np.fill_diagonal(fn_matrix, 0)
+        fig_size  = max(16, len(class_names) * 0.65)
+
+        # Counts
+        fig, ax = plt.subplots(figsize=(fig_size, fig_size * 0.9))
+        mask = fn_matrix == 0
+        sns.heatmap(fn_matrix, annot=True, fmt='.0f', cmap='Oranges', mask=mask,
+                    xticklabels=class_names, yticklabels=class_names,
+                    linewidths=0.5, linecolor='lightgray',
+                    cbar_kws={'label': 'FN count'}, annot_kws={'size': 9}, ax=ax)
+        sns.heatmap(fn_matrix, annot=False, cmap=['#f7f7f7'], mask=~mask,
+                    xticklabels=class_names, yticklabels=class_names,
+                    linewidths=0.5, linecolor='lightgray',
+                    cbar=False, alpha=0.4, ax=ax)
+        ax.set_title('False Negative Matrix (counts)\n'
+                     'Row = true class  |  Column = predicted class  |  Diagonal removed',
+                     fontsize=15, fontweight='bold', pad=18)
+        ax.set_xlabel('Predicted', fontsize=13, fontweight='bold')
+        ax.set_ylabel('True',      fontsize=13, fontweight='bold')
+        ax.set_xticklabels(ax.get_xticklabels(), rotation=45, ha='right')
+        ax.set_yticklabels(ax.get_yticklabels(), rotation=0)
+        fig.tight_layout()
+        self._save(fig, self.error_dir / 'fn_confusion_matrix.png', dpi=400)
+
+        # Normalised
+        row_sums  = cm.sum(axis=1, keepdims=True)
+        fn_norm   = np.where(row_sums > 0, fn_matrix / row_sums, 0)
+        np.fill_diagonal(fn_norm, 0)
+        mask_norm = fn_norm == 0
+
+        fig, ax = plt.subplots(figsize=(fig_size, fig_size * 0.9))
+        sns.heatmap(fn_norm, annot=True, fmt='.2%', cmap='Oranges', mask=mask_norm,
+                    xticklabels=class_names, yticklabels=class_names,
+                    vmin=0, vmax=1, linewidths=0.5, linecolor='lightgray',
+                    cbar_kws={'label': 'FN rate (% of true class)'},
+                    annot_kws={'size': 9}, ax=ax)
+        sns.heatmap(fn_norm, annot=False, cmap=['#f7f7f7'], mask=~mask_norm,
+                    xticklabels=class_names, yticklabels=class_names,
+                    linewidths=0.5, linecolor='lightgray',
+                    cbar=False, alpha=0.4, ax=ax)
+        ax.set_title('False Negative Matrix (normalised %)\n'
+                     'Row = true class  |  Column = predicted class  |  Diagonal removed',
+                     fontsize=15, fontweight='bold', pad=18)
+        ax.set_xlabel('Predicted', fontsize=13, fontweight='bold')
+        ax.set_ylabel('True',      fontsize=13, fontweight='bold')
+        ax.set_xticklabels(ax.get_xticklabels(), rotation=45, ha='right')
+        ax.set_yticklabels(ax.get_yticklabels(), rotation=0)
+        fig.tight_layout()
+        self._save(fig, self.error_dir / 'fn_confusion_matrix_normalized.png', dpi=400)
+
+    # ------------------------------------------------------------------
+    # CSV – high-confidence errors
+    # ------------------------------------------------------------------
+    def _save_high_conf_errors(self, y_true, y_pred, y_probs, class_names,
+                                filenames, top_n=50):
+        error_mask        = y_true != y_pred
+        error_conf        = y_probs[error_mask].max(axis=1)
+        error_true        = y_true[error_mask]
+        error_pred        = y_pred[error_mask]
+        error_files       = np.array(filenames)[error_mask]
+        true_class_scores = y_probs[error_mask][
+            np.arange(error_mask.sum()), error_true
+        ]
+        df = pd.DataFrame({
+            'filename':         error_files,
+            'true_class':       [class_names[i] for i in error_true],
+            'predicted_class':  [class_names[i] for i in error_pred],
+            'pred_confidence':  error_conf.round(4),
+            'true_class_score': true_class_scores.round(4),
+            'fp_for_class':     [class_names[p] for p in error_pred],
+            'fn_for_class':     [class_names[t] for t in error_true],
+        })
+        df = df.sort_values('pred_confidence', ascending=False).head(top_n)
+        df.to_csv(self.metrics_dir / 'fp_fn_high_conf_errors.csv', index=False)
+        log.info(f"  ✓  fp_fn_high_conf_errors.csv ({len(df)} rows)")
+
+def plot_summary(metrics, meta, cfg, out):
+    fig = plt.figure(figsize=(16, 11)); ax = fig.add_subplot(111); ax.axis('off')
+    ep    = meta.get('epoch', 'N/A')
+    val   = meta.get('val_acc')
+    val_s = f"{val*100:.2f}%" if isinstance(val, float) else str(val)
+    text = f"""
+╔══════════════════════════════════════════════════════════════════════════╗
+║       ConstrainedViViT (85-86% plateau target)  ·  TEST SUMMARY         ║
+╚══════════════════════════════════════════════════════════════════════════╝
+
+📊  OVERALL PERFORMANCE
+{'═'*74}
+  Accuracy                  : {metrics['accuracy']*100:7.3f}%
+  Balanced Accuracy         : {metrics['balanced_accuracy']*100:7.3f}%
+  Macro Precision           : {metrics['macro_precision']*100:7.3f}%
+  Macro Recall              : {metrics['macro_recall']*100:7.3f}%
+  Macro F1-Score            : {metrics['macro_f1']*100:7.3f}%
+  Weighted F1-Score         : {metrics['weighted_f1']*100:7.3f}%
+  Mean Average Precision    : {metrics['mean_ap']*100:7.3f}%
+  Mean ROC-AUC              : {metrics['mean_auc']*100:7.3f}%
+
+📈  TOP-K ACCURACY
+{'═'*74}
+  Top-1  :  {metrics['top_k'].get(1,0)*100:7.3f}%
+  Top-3  :  {metrics['top_k'].get(3,0)*100:7.3f}%
+  Top-5  :  {metrics['top_k'].get(5,0)*100:7.3f}%
+
+🔍  CLASS EXTREMES
+{'═'*74}
+  Best  : {metrics['best_class']:<22}  F1 = {metrics['best_class_f1']*100:.2f}%
+  Worst : {metrics['worst_class']:<22}  F1 = {metrics['worst_class_f1']*100:.2f}%
+
+⚙️   MODEL CONFIG (auto-detected from checkpoint)
+{'═'*74}
+  embed_dim      : {cfg.get('embed_dim')}     num_frames : {cfg.get('num_frames')}
+  img_size       : {cfg.get('img_size')}     patch_size  : {cfg.get('patch_size')}
+  spatial_depth  : {cfg.get('spatial_depth')}       temporal_depth : {cfg.get('temporal_depth')}
+  num_heads      : {cfg.get('num_heads')}       mlp_ratio      : {cfg.get('mlp_ratio')}
+  dropout        : {cfg.get('dropout')}
+
+🔖  CHECKPOINT
+{'═'*74}
+  Epoch : {ep}    Val accuracy : {val_s}
+
+📅  Test date : {datetime.now().strftime('%Y-%m-%d  %H:%M:%S')}
 """
-        
-        ax.text(0.05, 0.95, summary_text, transform=ax.transAxes,
-               fontsize=10, verticalalignment='top', fontfamily='monospace',
-               bbox=dict(boxstyle='round', facecolor='lightblue', alpha=0.3))
-        
-        plt.tight_layout()
-        plt.savefig(save_path, dpi=400, bbox_inches='tight')
-        plt.close()
-        logger.info("✓ Summary report saved (400 DPI)")
+    ax.text(0.03, 0.97, text, transform=ax.transAxes, fontsize=9.5,
+            va='top', fontfamily='monospace',
+            bbox=dict(boxstyle='round', fc='#deeeff', alpha=0.45))
+    fig.tight_layout(); _save(fig, out / 'summary_report.png')
 
 
-# -------------------------
-# Model Tester
-# -------------------------
-class ModelTester:
-    def __init__(self, model_path, test_dir, config=None):
-        self.model_path = Path(model_path)
-        self.test_dir = Path(test_dir)
-        
-        # Use CPU for Mac (MPS support is optional)
-        if torch.backends.mps.is_available() and torch.backends.mps.is_built():
-            self.device = torch.device('mps')
-            logger.info("Using MPS (Apple Silicon GPU)")
-        else:
-            self.device = torch.device('cpu')
-            logger.info("Using CPU")
-        
-        # Create results directory
-        self.results_dir = Path('./../../output/vivit/new')
-        self.results_dir.mkdir(parents=True, exist_ok=True)
-        
-        self.plot_dir = self.results_dir / 'plots'
-        self.plotter = TestingPlotter(self.plot_dir)
-        
-        # Load model and config
-        self.checkpoint = torch.load(model_path, map_location=self.device)
-        self.config = config if config else self.checkpoint.get('config', {})
-        
-        logger.info(f"Loaded checkpoint from: {model_path}")
-        logger.info(f"Checkpoint epoch: {self.checkpoint.get('epoch', 'N/A')}")
-        logger.info(f"Checkpoint val accuracy: {self.checkpoint.get('val_accuracy', 'N/A')}")
-    
-    def load_model(self, num_classes):
-        """Load the trained model"""
-        model = SlowLearningViViT(
-            img_size=self.config.get('img_size', 112),
-            patch_size=self.config.get('patch_size', 16),
-            tubelet_size=self.config.get('tubelet_size', 2),
-            num_frames=self.config.get('num_frames', 8),
-            in_chans=3,
-            num_classes=num_classes,
-            embed_dim=self.config.get('embed_dim', 256),
-            num_heads=self.config.get('num_heads', 8),
-            num_layers=self.config.get('num_layers', 6),
-            mlp_ratio=self.config.get('mlp_ratio', 4.0),
-            dropout=self.config.get('dropout_rate', 0.2),
-            attention_dropout=self.config.get('attention_dropout', 0.3)
-        )
-        
-        model.load_state_dict(self.checkpoint['model_state_dict'])
-        model = model.to(self.device)
-        model.eval()
-        
-        total_params = sum(p.numel() for p in model.parameters())
-        logger.info(f"Model loaded with {total_params:,} parameters")
-        
-        return model
-    
-    def test(self):
-        """Run testing on test dataset"""
-        logger.info("\n" + "="*80)
-        logger.info("STARTING MODEL TESTING")
-        logger.info("="*80)
-        
-        # Load test dataset
-        test_dataset = NPZDirectoryDataset(
-            self.test_dir,
-            num_frames=self.config.get('num_frames', 8),
-            img_size=self.config.get('img_size', 112)
-        )
-        
-        test_loader = DataLoader(
-            test_dataset,
-            batch_size=self.config.get('batch_size', 16),
-            shuffle=False,
-            num_workers=0,
-            pin_memory=False
-        )
-        
-        class_names = test_dataset.classes
-        num_classes = len(class_names)
-        
-        # Load model
-        model = self.load_model(num_classes)
-        
-        # Testing
-        all_preds = []
-        all_labels = []
-        all_probs = []
-        all_filenames = []
-        
-        logger.info("\nRunning inference...")
-        with torch.no_grad():
-            for inputs, labels, filenames in tqdm(test_loader, desc="Testing"):
-                inputs = inputs.to(self.device)
-                labels = labels.to(self.device)
-                
-                outputs = model(inputs)
-                probs = torch.softmax(outputs, dim=1)
-                _, preds = outputs.max(1)
-                
-                all_preds.extend(preds.cpu().numpy())
-                all_labels.extend(labels.cpu().numpy())
-                all_probs.extend(probs.cpu().numpy())
-                all_filenames.extend(filenames)
-        
-        all_preds = np.array(all_preds)
-        all_labels = np.array(all_labels)
-        all_probs = np.array(all_probs)
-        
-        # Calculate metrics
-        logger.info("\nCalculating metrics...")
-        metrics = self.calculate_metrics(all_labels, all_preds, all_probs, class_names)
-        
-        # Generate plots
-        logger.info("\nGenerating plots...")
-        self.plotter.plot_confusion_matrix(all_labels, all_preds, class_names)
-        self.plotter.plot_normalized_confusion_matrix(all_labels, all_preds, class_names)
-        
-        # Generate PR curves (NEW)
-        logger.info("\nGenerating PR curves...")
-        ap_scores, mean_ap = self.plotter.plot_pr_curves_combined(all_labels, all_probs, class_names)
-        individual_ap_scores = self.plotter.plot_pr_curves_individual(all_labels, all_probs, class_names)
-        
-        # Add mAP to metrics
-        metrics['mean_ap'] = mean_ap
-        metrics['per_class_ap'] = {class_names[i]: ap_scores[i][1] for i in range(len(class_names))}
-        
-        # Get per-class metrics from classification report
-        report = classification_report(all_labels, all_preds, target_names=class_names, output_dict=True)
-        precisions = [report[cn]['precision'] for cn in class_names]
-        recalls = [report[cn]['recall'] for cn in class_names]
-        f1_scores = [report[cn]['f1-score'] for cn in class_names]
-        supports = [report[cn]['support'] for cn in class_names]
-        
-        self.plotter.plot_per_class_metrics(class_names, precisions, recalls, f1_scores, supports)
-        
-        # Top-K accuracy
-        top_k_accs = {}
-        for k in [1, 3, 5]:
-            if k <= num_classes:
-                top_k_accs[k] = self.calculate_top_k_accuracy(all_probs, all_labels, k)
-        
-        if top_k_accs:
-            self.plotter.plot_top_k_accuracy(top_k_accs)
-        
-        # Add top-k to metrics
-        metrics.update({
-            'top_1_acc': top_k_accs.get(1, 0),
-            'top_3_acc': top_k_accs.get(3, 0),
-            'top_5_acc': top_k_accs.get(5, 0)
-        })
-        
-        # Create summary report
-        self.plotter.create_summary_report(
-            metrics, 
-            self.config, 
-            self.plot_dir / 'summary_report.png'
-        )
-        
-        # Save detailed results
-        self.save_results(metrics, class_names, all_labels, all_preds, all_probs, all_filenames)
-        
-        # Print summary
-        self.print_summary(metrics)
-        
-        logger.info("\n" + "="*80)
-        logger.info("TESTING COMPLETED!")
-        logger.info("="*80)
-        logger.info(f"All results saved to: {self.results_dir}")
-        
-        return metrics
-    
-    def calculate_metrics(self, y_true, y_pred, y_probs, class_names):
-        """Calculate comprehensive metrics"""
-        accuracy = accuracy_score(y_true, y_pred)
-        macro_precision = precision_score(y_true, y_pred, average='macro')
-        macro_recall = recall_score(y_true, y_pred, average='macro')
-        macro_f1 = f1_score(y_true, y_pred, average='macro')
-        weighted_f1 = f1_score(y_true, y_pred, average='weighted')
-        
-        # Per-class F1 scores
-        report = classification_report(y_true, y_pred, target_names=class_names, output_dict=True)
-        class_f1_scores = {cn: report[cn]['f1-score'] for cn in class_names}
-        
-        best_class = max(class_f1_scores.items(), key=lambda x: x[1])
-        worst_class = min(class_f1_scores.items(), key=lambda x: x[1])
-        
-        metrics = {
-            'accuracy': accuracy,
-            'macro_precision': macro_precision,
-            'macro_recall': macro_recall,
-            'macro_f1': macro_f1,
-            'weighted_f1': weighted_f1,
-            'num_classes': len(class_names),
-            'total_samples': len(y_true),
-            'samples_per_class': len(y_true) / len(class_names),
-            'best_class': {'name': best_class[0], 'f1': best_class[1]},
-            'worst_class': {'name': worst_class[0], 'f1': worst_class[1]},
-            'class_f1_scores': class_f1_scores
-        }
-        
-        return metrics
-    
-    def calculate_top_k_accuracy(self, y_probs, y_true, k):
-        """Calculate Top-K accuracy"""
-        top_k_preds = np.argsort(y_probs, axis=1)[:, -k:]
-        correct = 0
-        for i, label in enumerate(y_true):
-            if label in top_k_preds[i]:
-                correct += 1
-        return correct / len(y_true)
-    
-    def save_results(self, metrics, class_names, y_true, y_pred, y_probs, filenames):
-        """Save detailed results to files"""
-        # Save metrics as JSON
-        metrics_serializable = {
-            k: float(v) if isinstance(v, (np.floating, float)) else v 
-            for k, v in metrics.items() 
-            if k not in ['best_class', 'worst_class', 'class_f1_scores', 'per_class_ap']
-        }
-        metrics_serializable['best_class'] = {
-            'name': metrics['best_class']['name'],
-            'f1': float(metrics['best_class']['f1'])
-        }
-        metrics_serializable['worst_class'] = {
-            'name': metrics['worst_class']['name'],
-            'f1': float(metrics['worst_class']['f1'])
-        }
-        metrics_serializable['class_f1_scores'] = {
-            k: float(v) for k, v in metrics['class_f1_scores'].items()
-        }
-        if 'per_class_ap' in metrics:
-            metrics_serializable['per_class_ap'] = {
-                k: float(v) for k, v in metrics['per_class_ap'].items()
-            }
-        
-        with open(self.results_dir / 'metrics.json', 'w') as f:
-            json.dump(metrics_serializable, f, indent=4)
-        logger.info("✓ Metrics saved to metrics.json")
-        
-        # Save classification report
-        report = classification_report(y_true, y_pred, target_names=class_names)
-        with open(self.results_dir / 'classification_report.txt', 'w') as f:
-            f.write("CLASSIFICATION REPORT\n")
-            f.write("=" * 80 + "\n\n")
-            f.write(report)
-            if 'mean_ap' in metrics:
-                f.write(f"\n\nMean Average Precision (mAP): {metrics['mean_ap']:.4f}\n")
-        logger.info("✓ Classification report saved")
-        
-        # Save detailed predictions
-        results_df = pd.DataFrame({
-            'filename': filenames,
-            'true_label': [class_names[label] for label in y_true],
-            'predicted_label': [class_names[pred] for pred in y_pred],
-            'correct': y_true == y_pred,
-            'confidence': np.max(y_probs, axis=1)
-        })
-        
-        # Add probability columns for each class
-        for i, class_name in enumerate(class_names):
-            results_df[f'prob_{class_name}'] = y_probs[:, i]
-        
-        results_df.to_csv(self.results_dir / 'detailed_predictions.csv', index=False)
-        logger.info("✓ Detailed predictions saved to CSV")
-        
-        # Save misclassified samples
-        misclassified_df = results_df[~results_df['correct']].copy()
-        misclassified_df = misclassified_df.sort_values('confidence', ascending=False)
-        misclassified_df.to_csv(self.results_dir / 'misclassified_samples.csv', index=False)
-        logger.info(f"✓ Found {len(misclassified_df)} misclassified samples")
-        
-        # Save confusion matrix as CSV
-        cm = confusion_matrix(y_true, y_pred)
-        cm_df = pd.DataFrame(cm, index=class_names, columns=class_names)
-        cm_df.to_csv(self.results_dir / 'confusion_matrix.csv')
-        logger.info("✓ Confusion matrix saved to CSV")
-        
-        # Save AP scores as CSV
-        if 'per_class_ap' in metrics:
-            ap_df = pd.DataFrame([
-                {'class': class_name, 'average_precision': ap}
-                for class_name, ap in metrics['per_class_ap'].items()
-            ])
-            ap_df = ap_df.sort_values('average_precision', ascending=False)
-            ap_df.to_csv(self.results_dir / 'average_precision_scores.csv', index=False)
-            logger.info("✓ Average Precision scores saved to CSV")
-    
-    def print_summary(self, metrics):
-        """Print summary to console"""
-        print("\n" + "="*80)
-        print("TEST RESULTS SUMMARY")
-        print("="*80)
-        print(f"\n📊 Overall Accuracy: {metrics['accuracy']*100:.2f}%")
-        print(f"📈 Macro F1-Score:   {metrics['macro_f1']*100:.2f}%")
-        print(f"📉 Weighted F1:      {metrics['weighted_f1']*100:.2f}%")
-        if 'mean_ap' in metrics:
-            print(f"🎯 Mean AP (mAP):    {metrics['mean_ap']*100:.2f}%")
-        print(f"\n✅ Best Class:  {metrics['best_class']['name']} (F1: {metrics['best_class']['f1']*100:.2f}%)")
-        print(f"❌ Worst Class: {metrics['worst_class']['name']} (F1: {metrics['worst_class']['f1']*100:.2f}%)")
-        print(f"\n📁 Total Samples: {metrics['total_samples']}")
-        print(f"🏷️  Number of Classes: {metrics['num_classes']}")
-        
-        if 'top_1_acc' in metrics:
-            print(f"\n🎯 Top-1 Accuracy: {metrics['top_1_acc']*100:.2f}%")
-            if 'top_3_acc' in metrics and metrics['top_3_acc'] > 0:
-                print(f"🎯 Top-3 Accuracy: {metrics['top_3_acc']*100:.2f}%")
-            if 'top_5_acc' in metrics and metrics['top_5_acc'] > 0:
-                print(f"🎯 Top-5 Accuracy: {metrics['top_5_acc']*100:.2f}%")
-        
-        print("="*80 + "\n")
+# ─────────────────────────────────────────────────────────────
+# Save metrics / CSV
+# ─────────────────────────────────────────────────────────────
+def save_metrics(metrics, cn, y_true, y_pred, y_probs, filenames, mdir):
+    def _f(v):
+        if isinstance(v, (np.floating, float)): return float(v)
+        if isinstance(v, (np.integer, int)):    return int(v)
+        return v
+
+    skip = {'class_report', 'per_class_ap', 'per_class_auc', 'top_k'}
+    out  = {k: _f(v) for k, v in metrics.items() if k not in skip}
+    out['top_k']         = {str(k): float(v) for k, v in metrics['top_k'].items()}
+    out['per_class_ap']  = {k: float(v) for k, v in metrics['per_class_ap'].items()}
+    out['per_class_auc'] = {k: float(v) for k, v in metrics['per_class_auc'].items()}
+    with open(mdir / 'metrics.json', 'w') as f: json.dump(out, f, indent=2)
+    log.info("  ✓  metrics.json")
+
+    rpt = classification_report(y_true, y_pred, target_names=cn)
+    with open(mdir / 'classification_report.txt', 'w') as f:
+        f.write("ConstrainedViViT — Classification Report\n" + "═"*78 + "\n\n")
+        f.write(rpt)
+        f.write(f"\nmAP  : {metrics['mean_ap']:.4f}\nmAUC : {metrics['mean_auc']:.4f}\n")
+    log.info("  ✓  classification_report.txt")
+
+    pd.DataFrame(confusion_matrix(y_true, y_pred), index=cn, columns=cn
+                 ).to_csv(mdir / 'confusion_matrix.csv')
+    log.info("  ✓  confusion_matrix.csv")
+
+    (pd.DataFrame(list(metrics['per_class_ap'].items()), columns=['class','ap'])
+       .sort_values('ap', ascending=False).to_csv(mdir/'average_precision_scores.csv', index=False))
+    (pd.DataFrame(list(metrics['per_class_auc'].items()), columns=['class','auc'])
+       .sort_values('auc', ascending=False).to_csv(mdir/'auc_scores.csv', index=False))
+    log.info("  ✓  average_precision_scores.csv  /  auc_scores.csv")
+
+    df = pd.DataFrame({
+        'filename':        filenames,
+        'true_label':      [cn[l] for l in y_true],
+        'predicted_label': [cn[p] for p in y_pred],
+        'correct':         (y_true == y_pred),
+        'confidence':      y_probs.max(axis=1),
+    })
+    for i, c in enumerate(cn): df[f'prob_{c}'] = y_probs[:, i]
+    df.to_csv(mdir / 'detailed_predictions.csv', index=False)
+    df[~df['correct']].sort_values('confidence', ascending=False
+                                   ).to_csv(mdir / 'misclassified_samples.csv', index=False)
+    log.info(f"  ✓  detailed_predictions.csv  /  misclassified_samples.csv "
+             f"({(~(y_true==y_pred)).sum()} errors)")
 
 
-# -------------------------
-# Main Testing Function
-# -------------------------
+# ─────────────────────────────────────────────────────────────
+# Main
+# ─────────────────────────────────────────────────────────────
 def main():
-    """
-    Main testing function
-    
-    Usage:
-        python test_vivit_mac.py
-    
-    Make sure to update the paths below:
-        - model_path: Path to your trained model checkpoint
-        - test_dir: Path to your test/validation dataset
-    """
-    
-    # ===== CONFIGURE THESE PATHS =====
-    model_path = './../../kaggle/training_output_vivit/new_output/best_model.pth'
-    test_dir = './../../videos_directory/npz_lightweight_videos_without_cropping_splitted_dataset/test'
-    # ==================================
-    
-    logger.info("\n" + "="*80)
-    logger.info("ViViT MODEL TESTING FOR MAC - WITH PR CURVES")
-    logger.info("="*80)
-    logger.info(f"\nModel: {model_path}")
-    logger.info(f"Test Data: {test_dir}")
-    logger.info("="*80 + "\n")
-    
-    # Check if paths exist
-    if not Path(model_path).exists():
-        logger.error(f"❌ Model file not found: {model_path}")
-        logger.info("\nPlease update the 'model_path' variable with the correct path to your model.")
-        return
-    
-    if not Path(test_dir).exists():
-        logger.error(f"❌ Test directory not found: {test_dir}")
-        logger.info("\nPlease update the 'test_dir' variable with the correct path to your test data.")
-        return
-    
-    try:
-        # Initialize tester
-        tester = ModelTester(model_path, test_dir)
-        
-        # Run testing
-        metrics = tester.test()
-        
-        # Success message
-        logger.info("\n✅ Testing completed successfully!")
-        logger.info(f"📁 Results saved to: {tester.results_dir}")
-        logger.info("\n📊 Generated files:")
-        logger.info("   • metrics.json - Numerical metrics (including mAP)")
-        logger.info("   • classification_report.txt - Detailed per-class metrics")
-        logger.info("   • detailed_predictions.csv - Per-sample predictions")
-        logger.info("   • misclassified_samples.csv - Incorrectly classified samples")
-        logger.info("   • confusion_matrix.csv - Confusion matrix data")
-        logger.info("   • average_precision_scores.csv - AP scores per class")
-        logger.info("   • plots/confusion_matrix.png (counts only, 400 DPI)")
-        logger.info("   • plots/confusion_matrix_normalized.png (percentages, 400 DPI)")
-        logger.info("   • plots/per_class_metrics.png (400 DPI)")
-        logger.info("   • plots/top_k_accuracy.png (400 DPI)")
-        logger.info("   • plots/pr_curves_combined.png (all classes, 400 DPI)")
-        logger.info("   • plots/pr_curves_individual/*.png (36 individual curves, 300 DPI)")
-        logger.info("   • plots/summary_report.png (400 DPI)")
-        
-    except Exception as e:
-        logger.error(f"\n❌ Testing failed: {e}")
-        import traceback
-        traceback.print_exc()
-        raise
+    out         = Path(__file__).parent / OUT_DIR    
+    plots_dir   = out / 'plots'
+    metrics_dir = out / 'metrics'
+    for d in [plots_dir, metrics_dir,
+              plots_dir/'pr_curves_individual',
+              plots_dir/'roc_curves_individual']:
+        d.mkdir(parents=True, exist_ok=True)
+
+    log.info("=" * 78)
+    log.info("ConstrainedViViT — Comprehensive Testing")
+    log.info("=" * 78)
+    log.info(f"Model    : {MODEL_PATH}")
+    log.info(f"Test dir : {TEST_DIR}")
+    log.info(f"Out dir  : {OUT_DIR}")
+
+    if not Path(MODEL_PATH).exists():
+        log.error(f"Model not found: {MODEL_PATH}"); return
+    if not Path(TEST_DIR).exists():
+        log.error(f"Test dir not found: {TEST_DIR}"); return
+
+    # Device
+    if torch.backends.mps.is_available():
+        device = torch.device('mps');  log.info("Device : MPS")
+    elif torch.cuda.is_available():
+        device = torch.device('cuda'); log.info("Device : CUDA")
+    else:
+        device = torch.device('cpu');  log.info("Device : CPU")
+
+    # Load & auto-detect
+    state_dict, saved_classes, meta = load_checkpoint(MODEL_PATH, device)
+    config = infer_config(state_dict)
+
+    # Dataset
+    dataset = NPZDataset(TEST_DIR, class_names=saved_classes,
+                         num_frames=config['num_frames'], img_size=config['img_size'])
+    loader  = DataLoader(dataset, batch_size=config['batch_size'],
+                         shuffle=False, num_workers=0, pin_memory=False)
+    cn = dataset.classes
+
+    # Model
+    model = ConstrainedViViT(
+        num_classes=len(cn), num_frames=config['num_frames'],
+        img_size=config['img_size'], patch_size=config['patch_size'],
+        embed_dim=config['embed_dim'], mlp_ratio=config['mlp_ratio'],
+        spatial_depth=config['spatial_depth'], temporal_depth=config['temporal_depth'],
+        heads=config['num_heads'], dropout=config['dropout'],
+    ).to(device)
+    model.load_state_dict(state_dict)
+    log.info("✓ Weights loaded — zero size mismatches")
+
+    # Run
+    log.info("\n── Inference ──────────────────────────────────────────")
+    y_pred, y_true, y_probs, filenames = run_inference(model, loader, device)
+
+    log.info("\n── Metrics ────────────────────────────────────────────")
+    metrics = compute_metrics(y_true, y_pred, y_probs, cn)
+
+    log.info("\n── Plots ──────────────────────────────────────────────")
+    plot_cm_counts(y_true, y_pred, cn, plots_dir)
+    plot_cm_normalised(y_true, y_pred, cn, plots_dir)
+    plot_per_class_metrics(cn, metrics['class_report'], plots_dir)
+    plot_class_accuracy_sorted(y_true, y_pred, cn, plots_dir)
+    plot_top_k(metrics['top_k'], plots_dir)
+    plot_pr_combined(y_true, y_probs, cn, plots_dir)
+    plot_pr_individual(y_true, y_probs, cn, plots_dir/'pr_curves_individual')
+    plot_roc_combined(y_true, y_probs, cn, plots_dir)
+    plot_roc_individual(y_true, y_probs, cn, plots_dir/'roc_curves_individual')
+    plot_calibration(y_true, y_probs, plots_dir)
+    plot_summary(metrics, meta, config, plots_dir)
+    plot_misclassification_heatmap(y_true, y_pred, cn, plots_dir)
+
+    log.info("\n── Saving metrics ─────────────────────────────────────")
+    save_metrics(metrics, cn, y_true, y_pred, y_probs, filenames, metrics_dir)
+
+    log.info("\n── FP/FN Error Analysis ───────────────────────────────")
+    analyzer     = FPFNAnalyzer(metrics_dir, plots_dir)
+    fpfn_summary = analyzer.analyze(y_pred, y_true, y_probs, cn, filenames)
+    log.info("\nFP/FN rates per class (sorted by FP rate):")
+    log.info(fpfn_summary.sort_values('fp_rate', ascending=False).to_string(index=False))
+    print(f"\n  FP/FN analysis → {(plots_dir / 'fp_fn_analysis').resolve()}")
+    print(f"  fp_fn_summary.csv + fp_fn_high_conf_errors.csv → {metrics_dir.resolve()}")
+
+    # Console summary
+    print("\n" + "═"*72)
+    print("  RESULTS — ConstrainedViViT")
+    print("═"*72)
+    print(f"  Accuracy          : {metrics['accuracy']*100:.3f}%")
+    print(f"  Balanced Accuracy : {metrics['balanced_accuracy']*100:.3f}%")
+    print(f"  Macro F1          : {metrics['macro_f1']*100:.3f}%")
+    print(f"  Weighted F1       : {metrics['weighted_f1']*100:.3f}%")
+    print(f"  mAP               : {metrics['mean_ap']*100:.3f}%")
+    print(f"  Mean AUC          : {metrics['mean_auc']*100:.3f}%")
+    for k, v in sorted(metrics['top_k'].items()):
+        print(f"  Top-{k} Accuracy   : {v*100:.3f}%")
+    print(f"\n  Best  : {metrics['best_class']}  (F1 {metrics['best_class_f1']*100:.2f}%)")
+    print(f"  Worst : {metrics['worst_class']}  (F1 {metrics['worst_class_f1']*100:.2f}%)")
+    print(f"\n  Samples : {metrics['total_samples']}  |  Classes : {metrics['num_classes']}")
+    print(f"  Output  → {out.resolve()}")
+    print("═"*72 + "\n")
+    log.info("✅  Done!")
 
 
-if __name__ == "__main__":
+if __name__ == '__main__':
     main()
